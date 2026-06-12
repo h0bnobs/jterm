@@ -78,7 +78,9 @@ HELP_TEXT = """\
   q        quit
 
 [b]During playback (mpv owns the terminal)[/b]
-  q        stop, return to browser (position is saved to the server)
+  A live control footer sits under the video with position, duration
+  and volume — the video can never draw over it, even when resizing.
+  q        stop (position is saved to the server)
   space    pause / resume
   ←/→      seek 5 s        ↑/↓   seek 1 min
   9/0      volume          m     mute
@@ -87,7 +89,8 @@ HELP_TEXT = """\
 [b]Sync[/b]
   Progress is reported to Jellyfin every few seconds, exactly like the
   mobile app: resume points, watched ticks and Next Up all stay in sync.
-  Episodes autoplay the next one when they finish (Ctrl-C to stay put).
+  When playback ends you land back on the library or collection you
+  were browsing, or Home.
 """
 
 

@@ -61,15 +61,17 @@ That means:
 - stop a video in jterm, pick it up on your phone at the same spot (and vice
   versa — Continue Watching positions from other devices appear in jterm)
 - finished items are ticked watched automatically and Next Up advances
-- when an episode ends, the next one starts after a 3-second countdown
-  (Ctrl-C to stay put)
+- when playback ends (or you press `q`) you land back on the library or
+  collection you were browsing — or Home if that is where you came from
 
 ## Playback control centre
 
-During playback the video fills the pane from the top and a constantly
-redrawn control bar sits directly under it: position / duration / volume
-plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s, `↑/↓` seek
-1 min, `9/0` volume, `m` mute, `[ ]` speed).
+During playback a fixed, coloured two-row control footer sits at the bottom
+of the pane: position / duration / volume plus the key hints (`q` quit,
+`space` pause, `←/→` seek 5 s, `↑/↓` seek 1 min, `9/0` volume, `m` mute,
+`[ ]` speed). The footer is updated live over mpv's IPC socket, and the
+video is kept out of its rows with a reserved bottom margin, so it can
+never be drawn over — including when the pane is resized mid-playback.
 
 ## Video output and quality
 
