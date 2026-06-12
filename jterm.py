@@ -111,6 +111,8 @@ HELP_TEXT = """\
   space    pause / resume
   ←/→      seek 5 s        ↑/↓   seek 1 min
   Ctrl+↑/↓ raise / lower quality (reloads in place, keeps position)
+  n / b    next / previous episode of the series (manual only —
+           movies have no sequence; Ctrl+→/← do the same)
   9/0      volume          m     mute
   [ / ]    playback speed  ,/.   frame step (paused)
 
@@ -125,9 +127,10 @@ HELP_TEXT = """\
 
 [b]Sync[/b]
   Progress is reported to Jellyfin every few seconds, exactly like the
-  mobile app: resume points, watched ticks and Next Up all stay in sync.
-  When playback ends you land back on the library or collection you
-  were browsing, or Home.
+  mobile app: resume points, watched ticks and Next Up all stay in sync
+  — across quality switches and n/b episode jumps too. When playback
+  ends you land back on the library or collection you were browsing,
+  or Home. Nothing autoplays: episodes advance only when you press n.
 
 [b]Browse while playing[/b]
   Enter takes over the terminal, so to keep browsing press o to play in

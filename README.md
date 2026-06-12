@@ -64,6 +64,8 @@ That means:
 - stop a video in jterm, pick it up on your phone at the same spot (and vice
   versa — Continue Watching positions from other devices appear in jterm)
 - finished items are ticked watched automatically and Next Up advances
+- sync survives quality switches and `n`/`b` episode jumps — every reload
+  gets its own play session at the right position
 - when playback ends (or you press `q`) you land back on the library or
   collection you were browsing — or Home if that is where you came from
 
@@ -72,10 +74,16 @@ That means:
 During playback a fixed, coloured two-row control footer sits at the bottom
 of the pane: position / duration / volume / live resolution / quality cap
 plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s, `↑/↓` seek
-1 min, `Ctrl+↑/↓` quality, `9/0` volume, `m` mute, `[ ]` speed). The footer
-is updated live over mpv's IPC socket, and the video is kept out of its
-rows with a reserved bottom margin, so it can never be drawn over —
-including when the pane is resized mid-playback.
+1 min, `Ctrl+↑/↓` quality, `n`/`b` next/previous episode, `9/0` volume,
+`m` mute, `[ ]` speed). The footer is updated live over mpv's IPC socket,
+and the video is kept out of its rows with a reserved bottom margin, so it
+can never be drawn over — including when the pane is resized mid-playback.
+
+While an episode of a show is playing, `n` jumps to the next episode and
+`b` to the previous one (`Ctrl+→`/`Ctrl+←` work too), reloading in place at
+that episode's resume point — entirely manual, nothing ever autoplays. For
+movies there is no sequence and the footer says so. These keys live inside
+mpv, so they never clash with the browser's `b` (play from the beginning).
 
 ## Video output and quality
 
