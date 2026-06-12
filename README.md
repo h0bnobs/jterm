@@ -42,7 +42,9 @@ Just like the mobile app, the home screen shows:
 | `Enter`  | Open folder / play (resumes where you left off)          |
 | `b`      | Play from the beginning                                  |
 | `a`      | Play audio only                                          |
-| `o`      | Open in an mpv window — browsing continues               |
+| `o`      | Play in the reusable mpv window — browsing continues     |
+| `e`      | Enqueue after what is playing in the window              |
+| `x`      | Stop the window player                                   |
 | `w`      | Toggle watched / unwatched                               |
 | `f`      | Toggle favourite                                         |
 | `d`      | Toggle GPU / hardware decoding (off by default)          |
@@ -95,6 +97,16 @@ resolution from the bitrate rather than the requested height, so trust the
 footer's live resolution readout; seeking far ahead of a transcode can stall
 while the server catches up; and if a transcode fails outright jterm falls
 back to source quality with a note in the footer.
+
+## Browse while playing
+
+In-terminal playback (`Enter`) hands the terminal to mpv, so to keep
+browsing press `o` instead: it plays in a single reusable mpv window and the
+TUI stays fully live. Press `o` on another result to swap it into the same
+window, `e` to queue it after the current one, `x` to stop. The status bar
+shows what the window is playing, and progress keeps syncing to Jellyfin
+for whichever item that is — including queued items as the playlist
+advances.
 
 ## GPU / hardware decoding
 
