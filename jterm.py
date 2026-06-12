@@ -15,6 +15,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,7 +40,6 @@ DISCOVERY_PORT = 7359
 DISCOVERY_MESSAGE = b"who is JellyfinServer?"
 DISCOVERY_TIMEOUT = 2.0
 PROGRESS_INTERVAL = 5.0
-FINISHED_RATIO = 0.92
 PAGE_LIMIT = 200
 # The /Users/{id}/Items list endpoint serves UserData from a server-side
 # cache that lags writes by 30s or more, while the single-item endpoint is
@@ -57,6 +57,9 @@ FOLDER_TYPES = {
     "CollectionFolder", "UserView", "Folder", "BoxSet", "Series", "Season",
     "MusicAlbum", "Playlist",
 }
+# Page sources counted as a library/collection for the end-of-playback
+# "return to where you were browsing" behaviour.
+LIBRARY_TYPES = {"CollectionFolder", "UserView", "BoxSet"}
 
 HELP_TEXT = """\
 [b]Browsing[/b]
@@ -75,7 +78,9 @@ HELP_TEXT = """\
   q        quit
 
 [b]During playback (mpv owns the terminal)[/b]
-  q        stop, return to browser (position is saved to the server)
+  A live control footer sits under the video with position, duration
+  and volume — the video can never draw over it, even when resizing.
+  q        stop (position is saved to the server)
   space    pause / resume
   ←/→      seek 5 s        ↑/↓   seek 1 min
   9/0      volume          m     mute
@@ -84,7 +89,8 @@ HELP_TEXT = """\
 [b]Sync[/b]
   Progress is reported to Jellyfin every few seconds, exactly like the
   mobile app: resume points, watched ticks and Next Up all stay in sync.
-  Episodes autoplay the next one when they finish (Ctrl-C to stay put).
+  When playback ends you land back on the library or collection you
+  were browsing, or Home.
 """
 
 
@@ -347,13 +353,6 @@ class PlaybackReporter(threading.Thread):
         self._req_id = 0
         self._halt = threading.Event()
 
-    # ratio of the item actually watched, for finished/autoplay decisions
-    def watched_ratio(self) -> float:
-        runtime = self.item.get("RunTimeTicks") or 0
-        if not runtime:
-            return 0.0
-        return self.last_ticks / runtime
-
     def stop(self) -> None:
         self._halt.set()
 
@@ -515,6 +514,102 @@ def resume_ticks(item: dict) -> int:
 
 
 # --------------------------------------------------------------------------
+# In-terminal video layout: a fixed, coloured control footer that mpv is
+# kept out of via a reserved bottom video margin (issue #1)
+# --------------------------------------------------------------------------
+
+FOOTER_ROWS = 2
+FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
+FOOTER_FG = "\x1b[38;2;236;236;245m"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+
+
+def footer_margin_ratio(lines: int) -> float:
+    """Fraction of the video area to reserve so the footer's rows stay clear.
+    Recomputed from the live terminal height so a resize keeps it exact."""
+    return round(FOOTER_ROWS / max(lines, FOOTER_ROWS + 1), 4)
+
+
+def footer_lines(st: dict, title: str, cols: int) -> list[str]:
+    """The two text lines shown in the control footer."""
+    icon = "⏸" if st.get("pause") else "▶"
+    pos = fmt_clock(st["time-pos"]) if st.get("time-pos") is not None else "0:00"
+    dur = fmt_clock(st["duration"]) if st.get("duration") else "?"
+    pct = f"{int(st['percent-pos'])}%" if st.get("percent-pos") is not None else "0%"
+    vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {title}"
+    return [line1, " " + KEY_HINTS]
+
+
+def draw_footer(lines_text: list[str], term_lines: int, cols: int) -> None:
+    """Paint the coloured footer band across its reserved bottom rows.
+    Autowrap is disabled so filling the final cell never scrolls, and the
+    cursor is parked at the top afterwards so any stray mpv output lands
+    there instead of scrolling the footer out of its rows."""
+    out = ["\x1b[?7l"]
+    first = term_lines - len(lines_text) + 1
+    for i, text in enumerate(lines_text):
+        cell = (text[:cols]).ljust(cols)
+        out.append(f"\x1b[{first + i};1H{FOOTER_BG}{FOOTER_FG}{cell}\x1b[0m")
+    out.append("\x1b[?7h\x1b[H")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+class MpvIPC:
+    """Tiny JSON-IPC client for a running mpv (--input-ipc-server)."""
+
+    def __init__(self, path: str):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(path)
+        self.sock.settimeout(0.4)
+        self.buf = b""
+        self._rid = 0
+
+    def get(self, prop: str):
+        self._rid += 1
+        rid = self._rid
+        try:
+            self.sock.sendall(
+                json.dumps({"command": ["get_property", prop], "request_id": rid}).encode() + b"\n"
+            )
+        except OSError:
+            return None
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            try:
+                self.buf += self.sock.recv(65536)
+            except socket.timeout:
+                break
+            except OSError:
+                return None
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("request_id") == rid:
+                    return msg.get("data") if msg.get("error") == "success" else None
+        return None
+
+    def command(self, cmd: list) -> None:
+        """Fire a command without waiting for its reply."""
+        try:
+            self.sock.sendall(json.dumps({"command": cmd}).encode() + b"\n")
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Modal screens
 # --------------------------------------------------------------------------
 
@@ -647,10 +742,12 @@ class HelpScreen(ModalScreen):
 class Page:
     """One level of the navigation stack."""
 
-    def __init__(self, title: str, loader, rows: list[tuple[str, dict]] | None = None):
+    def __init__(self, title: str, loader,
+                 source: dict | None = None):
         self.title = title
         self.loader = loader          # callable -> list[(section, item)]
-        self.rows = rows or []
+        self.source = source          # the item this page was opened from
+        self.rows: list[tuple[str, dict]] = []
         self.cursor = 0
 
 
@@ -873,10 +970,10 @@ class JTerm(App):
 
     # -- page loading ----------------------------------------------------------
 
-    def push_page(self, title: str, loader) -> None:
+    def push_page(self, title: str, loader, source: dict | None = None) -> None:
         if self.stack:
             self.stack[-1].cursor = self.query_one(DataTable).cursor_row or 0
-        self.stack.append(Page(title, loader))
+        self.stack.append(Page(title, loader, source))
         self.query_one(DataTable).loading = True
         self.set_status(f"loading {title}…")
         self.load_page(self.stack[-1], False)
@@ -986,7 +1083,7 @@ class JTerm(App):
             return
         _section, item = sel
         if is_folder(item):
-            self.push_page(item.get("Name") or "?", self._loader_children(item))
+            self.push_page(item.get("Name") or "?", self._loader_children(item), item)
         else:
             self._play("terminal", item, resume_ticks(item))
 
@@ -1109,25 +1206,28 @@ class JTerm(App):
             tempfile.gettempdir(),
             f"jterm-mpv-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock")
 
-    def _term_cmd(self, mode: str) -> tuple[list[str], str] | None:
-        """Build the in-terminal mpv command and a fresh IPC socket path."""
-        sock_path = self._new_sock_path()
+    def _video_cmd(self, url: str, start_ticks: int, sock_path: str) -> list[str] | None:
+        """Build the in-terminal mpv command with the footer band reserved.
+
+        --video-margin-ratio-bottom physically keeps the video out of the
+        footer's rows (unlike --vo-kitty-rows, which only overrides mpv's
+        size detection and lets the image draw over the band anyway).
+        """
         cmd = self._mpv_base(sock_path)
         if cmd is None:
             return None
-        cmd.append(f"--term-status-msg={MPV_STATUS}")
-        if mode == "audio":
-            cmd.append("--no-video")
-        else:
-            size = shutil.get_terminal_size()
-            video_rows = max(size.lines - 2, 4)
-            cmd += [f"--vo={self.vo}", "--profile=sw-fast"]
-            if self.vo == "tct":
-                cmd.append(f"--vo-tct-height={video_rows}")
-            elif self.vo == "kitty":
-                cmd += ["--vo-kitty-use-shm=yes",
-                        f"--vo-kitty-rows={video_rows}", "--vo-kitty-top=1"]
-        return cmd, sock_path
+        ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
+        cmd += [
+            f"--vo={self.vo}", "--profile=sw-fast",
+            "--term-status-msg=",
+            f"--video-margin-ratio-bottom={ratio:.4f}",
+        ]
+        if self.vo == "kitty":
+            cmd.append("--vo-kitty-use-shm=yes")
+        if start_ticks:
+            cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
+        cmd.append(url)
+        return cmd
 
     @staticmethod
     def _display_title(item: dict) -> str:
@@ -1158,53 +1258,120 @@ class JTerm(App):
             self.set_status(f"playing in window: {title[:60]} (browse continues)")
             return
 
-        mode_desc = ("audio only" if mode == "audio"
-                     else f"video {self.vo} · direct play")
         played_ids: list[str] = []
         with self.suspend():
-            current, current_start, current_title = item, start_ticks, title
-            while True:
-                built = self._term_cmd(mode)
-                if built is None:
-                    break
-                cmd, sock_path = built
-                if current_start:
-                    cmd.append(f"--start={current_start // TICKS_PER_SECOND}")
-                cmd.append(self.jf.stream_url(current["Id"]))
-
-                os.system("clear")
-                desc = mode_desc
-                if current_start:
-                    desc += f" │ resuming from {fmt_clock(current_start / TICKS_PER_SECOND)}"
-                self._print_control_centre(current_title, desc)
-
-                reporter = PlaybackReporter(self.jf, current, sock_path, current_start)
-                reporter.start()
-                try:
-                    subprocess.call(cmd)
-                except KeyboardInterrupt:
-                    pass
-                reporter.stop()
-                reporter.join(timeout=10)
-                played_ids.append(current["Id"])
-                title = current_title
-
-                # autoplay the next episode if this one was watched to the end
-                nxt = None
-                if reporter.watched_ratio() >= FINISHED_RATIO:
-                    nxt = self._next_episode(current)
-                if not nxt:
-                    break
-                nxt_title = self._display_title(nxt)
-                print(f"\n▶ up next: {nxt_title}  (starting in 3s — Ctrl-C to cancel)")
-                try:
-                    time.sleep(3)
-                except KeyboardInterrupt:
-                    break
-                current, current_start, current_title = nxt, resume_ticks(nxt), nxt_title
-
+            os.system("clear")
+            try:
+                if mode == "audio":
+                    self._play_audio(item, start_ticks, played_ids)
+                else:
+                    self._run_mpv_with_footer(item, start_ticks, played_ids)
+            except KeyboardInterrupt:
+                pass
         self.set_status(f"finished: {title[:60]}")
+        self._return_to_parent()
         self.refresh_after_play(played_ids)
+
+    def _return_to_parent(self) -> None:
+        """After playback ends, land back on the page you were browsing
+        from: the nearest ancestor library or collection, or Home when the
+        item came from Home, Continue Watching, Next Up or a search."""
+        if not self.stack:
+            return
+        keep = 0  # Home
+        for i, page in enumerate(self.stack):
+            if (page.source or {}).get("Type") in LIBRARY_TYPES:
+                keep = i
+        if keep == len(self.stack) - 1:
+            # already on the right page — keep the cursor where it was
+            page = self.stack[-1]
+            page.cursor = self.query_one(DataTable).cursor_row or page.cursor
+        else:
+            del self.stack[keep + 1:]
+
+    def _play_audio(self, item: dict, start_ticks: int,
+                    played_ids: list[str]) -> None:
+        """Audio has no video to overdraw, so the static banner plus mpv's
+        own status line is still the right tool."""
+        sock_path = self._new_sock_path()
+        cmd = self._mpv_base(sock_path)
+        if cmd is None:
+            return
+        cmd += [f"--term-status-msg={MPV_STATUS}", "--no-video"]
+        if start_ticks:
+            cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
+        cmd.append(self.jf.stream_url(item["Id"]))
+        desc = "audio only"
+        if start_ticks:
+            desc += f" │ resuming from {fmt_clock(start_ticks / TICKS_PER_SECOND)}"
+        self._print_control_centre(self._display_title(item), desc)
+        reporter = PlaybackReporter(self.jf, item, sock_path, start_ticks)
+        reporter.start()
+        played_ids.append(item["Id"])
+        try:
+            subprocess.call(cmd)
+        finally:
+            reporter.stop()
+            reporter.join(timeout=10)
+
+    def _run_mpv_with_footer(self, item: dict, start_ticks: int,
+                             played_ids: list[str]) -> PlaybackReporter | None:
+        """Launch mpv on the item and paint the live control footer until it
+        exits. The footer loop and the PlaybackReporter are independent
+        clients of the same mpv IPC socket: the loop owns the process and
+        the screen, the reporter mirrors progress to the server."""
+        sock_path = self._new_sock_path()
+        title = self._display_title(item)
+        size = shutil.get_terminal_size()
+        draw_footer([" loading…", " " + KEY_HINTS], size.lines, size.columns)
+        cmd = self._video_cmd(self.jf.stream_url(item["Id"]), start_ticks, sock_path)
+        if cmd is None:
+            return None
+        proc = subprocess.Popen(cmd)
+        reporter = PlaybackReporter(self.jf, item, sock_path, start_ticks)
+        reporter.start()
+        played_ids.append(item["Id"])
+        ipc = None
+        deadline = time.time() + 15
+        while time.time() < deadline and proc.poll() is None:
+            if os.path.exists(sock_path):
+                try:
+                    ipc = MpvIPC(sock_path)
+                    break
+                except OSError:
+                    pass
+            time.sleep(0.15)
+        props = ("time-pos", "duration", "percent-pos", "volume", "pause")
+        last_lines = None
+        try:
+            while proc.poll() is None:
+                size = shutil.get_terminal_size()
+                # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as
+                # the pane is resized, so the video can never creep over it.
+                if ipc and size.lines != last_lines:
+                    ipc.command(["set_property", "video-margin-ratio-bottom",
+                                 footer_margin_ratio(size.lines)])
+                    last_lines = size.lines
+                st = {p: ipc.get(p) for p in props} if ipc else {}
+                draw_footer(footer_lines(st, title, size.columns),
+                            size.lines, size.columns)
+                time.sleep(0.25)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if ipc:
+                ipc.close()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.terminate()
+            reporter.stop()
+            reporter.join(timeout=10)
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+        return reporter
 
     @work(thread=True, group="userdata")
     def refresh_after_play(self, item_ids: list[str]) -> None:
@@ -1216,7 +1383,10 @@ class JTerm(App):
                                    (self.jf.item(item_id) or {}).get("UserData"))
             except JFError:
                 pass
-        self.call_from_thread(self.reload_page)
+        if self.stack:
+            # not reload_page: the table may still show a deeper page after
+            # _return_to_parent, so its cursor must not overwrite this one
+            self.call_from_thread(self.load_page, self.stack[-1], True)
 
 
 def main() -> None:
