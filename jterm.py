@@ -543,13 +543,15 @@ def footer_lines(st: dict, title: str, cols: int) -> list[str]:
 
 def draw_footer(lines_text: list[str], term_lines: int, cols: int) -> None:
     """Paint the coloured footer band across its reserved bottom rows.
-    Autowrap is disabled so filling the final cell never scrolls."""
+    Autowrap is disabled so filling the final cell never scrolls, and the
+    cursor is parked at the top afterwards so any stray mpv output lands
+    there instead of scrolling the footer out of its rows."""
     out = ["\x1b[?7l"]
     first = term_lines - len(lines_text) + 1
     for i, text in enumerate(lines_text):
         cell = (text[:cols]).ljust(cols)
         out.append(f"\x1b[{first + i};1H{FOOTER_BG}{FOOTER_FG}{cell}\x1b[0m")
-    out.append("\x1b[?7h")
+    out.append("\x1b[?7h\x1b[H")
     sys.stdout.write("".join(out))
     sys.stdout.flush()
 
