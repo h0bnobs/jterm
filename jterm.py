@@ -545,7 +545,9 @@ def footer_lines(st: dict, title: str, cols: int) -> list[str]:
     dur = fmt_clock(st["duration"]) if st.get("duration") else "?"
     pct = f"{int(st['percent-pos'])}%" if st.get("percent-pos") is not None else "0%"
     vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
-    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {title}"
+    w, h = st.get("width"), st.get("height")
+    res = f"{w}x{h}" if w and h else "…"
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}   {title}"
     return [line1, " " + KEY_HINTS]
 
 
@@ -1377,7 +1379,8 @@ class JTerm(App):
                 except OSError:
                     pass
             time.sleep(0.15)
-        props = ("time-pos", "duration", "percent-pos", "volume", "pause")
+        props = ("time-pos", "duration", "percent-pos", "volume", "pause",
+                 "width", "height")
         last_lines = None
         try:
             while proc.poll() is None:
