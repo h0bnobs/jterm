@@ -40,7 +40,6 @@ DISCOVERY_PORT = 7359
 DISCOVERY_MESSAGE = b"who is JellyfinServer?"
 DISCOVERY_TIMEOUT = 2.0
 PROGRESS_INTERVAL = 5.0
-FINISHED_RATIO = 0.92
 PAGE_LIMIT = 200
 # The /Users/{id}/Items list endpoint serves UserData from a server-side
 # cache that lags writes by 30s or more, while the single-item endpoint is
@@ -347,13 +346,6 @@ class PlaybackReporter(threading.Thread):
         self.last_ticks = start_ticks
         self._req_id = 0
         self._halt = threading.Event()
-
-    # ratio of the item actually watched, for finished/autoplay decisions
-    def watched_ratio(self) -> float:
-        runtime = self.item.get("RunTimeTicks") or 0
-        if not runtime:
-            return 0.0
-        return self.last_ticks / runtime
 
     def stop(self) -> None:
         self._halt.set()
@@ -1263,7 +1255,7 @@ class JTerm(App):
                 if mode == "audio":
                     self._play_audio(item, start_ticks, played_ids)
                 else:
-                    self._play_video(item, start_ticks, played_ids)
+                    self._run_mpv_with_footer(item, start_ticks, played_ids)
             except KeyboardInterrupt:
                 pass
         self.set_status(f"finished: {title[:60]}")
@@ -1293,26 +1285,6 @@ class JTerm(App):
         finally:
             reporter.stop()
             reporter.join(timeout=10)
-
-    def _play_video(self, item: dict, start_ticks: int,
-                    played_ids: list[str]) -> None:
-        current, current_start = item, start_ticks
-        while True:
-            reporter = self._run_mpv_with_footer(current, current_start, played_ids)
-            if reporter is None:
-                return
-            # autoplay the next episode if this one was watched to the end
-            nxt = None
-            if reporter.watched_ratio() >= FINISHED_RATIO:
-                nxt = self._next_episode(current)
-            if not nxt:
-                return
-            size = shutil.get_terminal_size()
-            draw_footer(
-                [f" ▶ up next: {self._display_title(nxt)}  (3s — Ctrl-C to cancel)",
-                 " " + KEY_HINTS], size.lines, size.columns)
-            time.sleep(3)  # Ctrl-C propagates to _play and cancels
-            current, current_start = nxt, resume_ticks(nxt)
 
     def _run_mpv_with_footer(self, item: dict, start_ticks: int,
                              played_ids: list[str]) -> PlaybackReporter | None:
