@@ -33,6 +33,13 @@ from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 CONFIG_PATH = os.path.expanduser("~/.config/jterm/config.json")
+INPUT_CONF_PATH = os.path.expanduser("~/.config/jterm/input.conf")
+# Ctrl+Up/Down change the quality cap by signalling jterm through an mpv
+# user-data property. Everything else keeps mpv defaults.
+INPUT_CONF = (
+    "Ctrl+UP set user-data/jterm/req up\n"
+    "Ctrl+DOWN set user-data/jterm/req down\n"
+)
 CLIENT_NAME = "jterm"
 CLIENT_VERSION = "0.1.0"
 TICKS_PER_SECOND = 10_000_000
@@ -113,6 +120,17 @@ HELP_TEXT = """\
 # --------------------------------------------------------------------------
 # Terminal video-output detection
 # --------------------------------------------------------------------------
+
+def ensure_input_conf() -> str:
+    """Write jterm's mpv key bindings and return the file path."""
+    try:
+        os.makedirs(os.path.dirname(INPUT_CONF_PATH), exist_ok=True)
+        with open(INPUT_CONF_PATH, "w") as f:
+            f.write(INPUT_CONF)
+    except OSError:
+        pass
+    return INPUT_CONF_PATH
+
 
 def detect_video_output() -> str:
     """Pick the best mpv --vo for this terminal. Override with JTERM_VO."""
@@ -565,7 +583,7 @@ def resume_ticks(item: dict) -> int:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · ⌃↑/↓ quality · m mute · [ ] speed"
 
 
 def footer_margin_ratio(lines: int) -> float:
@@ -583,7 +601,9 @@ def footer_lines(st: dict, title: str, cols: int) -> list[str]:
     vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
     w, h = st.get("width"), st.get("height")
     res = f"{w}x{h}" if w and h else "…"
-    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}   {title}"
+    cap = st.get("cap")
+    capstr = f" (≤{cap}p)" if cap and cap != "source" else " (source)"
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}{capstr}   {title}"
     return [line1, " " + KEY_HINTS]
 
 
@@ -837,6 +857,8 @@ class JTerm(App):
         if not self.cfg.get("device_id"):
             self.cfg["device_id"] = uuid.uuid4().hex
         self.hwdec = bool(self.cfg.get("hwdec", False))
+        cap = self.cfg.get("quality_cap", "source")
+        self.quality_cap = cap if cap in QUALITY_CAPS else "source"
         self.jf: Jellyfin | None = None
         self.server_name = ""
         self.username = self.cfg.get("username") or ""
@@ -1236,6 +1258,7 @@ class JTerm(App):
         return [
             mpv, "--osc=no", "--msg-level=all=error,statusline=status",
             "--term-osd-bar=no", "--force-seekable=yes",
+            f"--input-conf={ensure_input_conf()}",
             f"--input-ipc-server={sock_path}",
             f"--user-agent={CLIENT_NAME}/{CLIENT_VERSION}",
         ]
@@ -1388,38 +1411,123 @@ class JTerm(App):
             reporter.stop()
             reporter.join(timeout=10)
 
+    @staticmethod
+    def _next_cap(cap, direction: str):
+        i = QUALITY_CAPS.index(cap) if cap in QUALITY_CAPS else 0
+        i = i - 1 if direction == "up" else i + 1
+        return QUALITY_CAPS[max(0, min(i, len(QUALITY_CAPS) - 1))]
+
+    def _persist_quality(self) -> None:
+        if self.cfg.get("quality_cap") != self.quality_cap:
+            self.cfg["quality_cap"] = self.quality_cap
+            save_config(self.cfg)
+
     def _run_mpv_with_footer(self, item: dict, start_ticks: int,
-                             played_ids: list[str]) -> PlaybackReporter | None:
+                             played_ids: list[str]) -> None:
         """Launch mpv on the item and paint the live control footer until it
         exits. The footer loop and the PlaybackReporter are independent
         clients of the same mpv IPC socket: the loop owns the process and
-        the screen, the reporter mirrors progress to the server."""
+        the screen, the reporter mirrors progress to the server. Ctrl+Up/
+        Down requests forwarded by mpv reload the stream at a new quality
+        cap, preserving the position; each (re)launch gets a fresh reporter
+        so resume positions and watched state stay correct throughout."""
         sock_path = self._new_sock_path()
         title = self._display_title(item)
-        size = shutil.get_terminal_size()
-        draw_footer([" loading…", " " + KEY_HINTS], size.lines, size.columns)
-        cmd = self._video_cmd(self.jf.stream_url(item["Id"]), start_ticks, sock_path)
-        if cmd is None:
-            return None
-        proc = subprocess.Popen(cmd)
-        reporter = PlaybackReporter(self.jf, item, sock_path, start_ticks)
-        reporter.start()
+        runtime = (item.get("RunTimeTicks") or 0) / TICKS_PER_SECOND
         played_ids.append(item["Id"])
-        ipc = None
-        deadline = time.time() + 15
-        while time.time() < deadline and proc.poll() is None:
-            if os.path.exists(sock_path):
+        reporter: PlaybackReporter | None = None
+
+        def stop_reporter() -> None:
+            nonlocal reporter
+            if reporter is None:
+                return
+            reporter.stop()
+            reporter.join(timeout=10)
+            if reporter.play_method == "Transcode":
                 try:
-                    ipc = MpvIPC(sock_path)
-                    break
-                except OSError:
+                    self.jf.stop_encoding(reporter.session_id)
+                except JFError:
                     pass
-            time.sleep(0.15)
+            reporter = None
+
+        def launch(cap, pos_ticks: int):
+            """Start mpv at pos_ticks under the given cap. Returns the
+            process, an IPC connection and the stream clock offset in
+            seconds (a mid-item transcode starts its clock at zero)."""
+            nonlocal reporter
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+            size = shutil.get_terminal_size()
+            label = "source" if cap == "source" else f"≤{cap}p"
+            draw_footer([f" loading… ({label})", " " + KEY_HINTS],
+                        size.lines, size.columns)
+            session_id = uuid.uuid4().hex
+            if cap == "source":
+                url = self.jf.stream_url(item["Id"])
+                cmd = self._video_cmd(url, pos_ticks, sock_path)
+                offset_ticks = 0
+            else:
+                url = self.jf.stream_url(item["Id"], cap, pos_ticks, session_id)
+                cmd = self._video_cmd(url, 0, sock_path)
+                offset_ticks = pos_ticks
+            if cmd is None:
+                return None, None, 0.0
+            proc = subprocess.Popen(cmd)
+            reporter = PlaybackReporter(
+                self.jf, item, sock_path, pos_ticks,
+                offset_ticks=offset_ticks,
+                play_method="DirectPlay" if cap == "source" else "Transcode",
+                session_id=session_id)
+            reporter.start()
+            ipc = None
+            deadline = time.time() + 15
+            while time.time() < deadline and proc.poll() is None:
+                if os.path.exists(sock_path):
+                    try:
+                        ipc = MpvIPC(sock_path)
+                        break
+                    except OSError:
+                        pass
+                time.sleep(0.15)
+            return proc, ipc, offset_ticks / TICKS_PER_SECOND
+
+        def relaunch(proc, ipc, cap, pos_ticks: int):
+            if ipc:
+                ipc.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            stop_reporter()
+            return launch(cap, pos_ticks)
+
+        proc, ipc, offset = launch(self.quality_cap, start_ticks)
+        launched_at = time.time()
         props = ("time-pos", "duration", "percent-pos", "volume", "pause",
                  "width", "height")
         last_lines = None
         try:
-            while proc.poll() is None:
+            while proc is not None:
+                if proc.poll() is not None:
+                    # a transcode that died straight away: the server
+                    # refused or cannot keep up — drop back to source
+                    if (self.quality_cap != "source" and proc.returncode
+                            and time.time() - launched_at < 8):
+                        pos_ticks = reporter.last_ticks if reporter else start_ticks
+                        size = shutil.get_terminal_size()
+                        draw_footer([" transcode failed — back to source quality",
+                                     " " + KEY_HINTS], size.lines, size.columns)
+                        time.sleep(1.5)
+                        self.quality_cap = "source"
+                        self._persist_quality()
+                        proc, ipc, offset = relaunch(proc, ipc, "source", pos_ticks)
+                        launched_at = time.time()
+                        last_lines = None
+                        continue
+                    break
                 size = shutil.get_terminal_size()
                 # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as
                 # the pane is resized, so the video can never creep over it.
@@ -1428,6 +1536,32 @@ class JTerm(App):
                                  footer_margin_ratio(size.lines)])
                     last_lines = size.lines
                 st = {p: ipc.get(p) for p in props} if ipc else {}
+                req = ipc.get("user-data/jterm/req") if ipc else None
+
+                if req in ("up", "down"):
+                    ipc.command(["set_property", "user-data/jterm/req", "none"])
+                    new_cap = self._next_cap(self.quality_cap, req)
+                    if new_cap != self.quality_cap:
+                        pos = (st.get("time-pos") or 0) + offset
+                        self.quality_cap = new_cap
+                        self._persist_quality()
+                        proc, ipc, offset = relaunch(
+                            proc, ipc, new_cap, int(pos * TICKS_PER_SECOND))
+                        launched_at = time.time()
+                        last_lines = None
+                    continue
+
+                # a transcode plays a partial, clock-rebased stream: shift
+                # the position and take duration/percent from the item
+                transcoding = self.quality_cap != "source"
+                if st.get("time-pos") is not None:
+                    st["time-pos"] += offset
+                if runtime and (transcoding or not st.get("duration")):
+                    st["duration"] = runtime
+                if runtime and st.get("time-pos") is not None and (
+                        transcoding or st.get("percent-pos") is None):
+                    st["percent-pos"] = st["time-pos"] * 100 / runtime
+                st["cap"] = self.quality_cap
                 draw_footer(footer_lines(st, title, size.columns),
                             size.lines, size.columns)
                 time.sleep(0.25)
@@ -1436,17 +1570,16 @@ class JTerm(App):
         finally:
             if ipc:
                 ipc.close()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.terminate()
-            reporter.stop()
-            reporter.join(timeout=10)
+            if proc is not None:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.terminate()
+            stop_reporter()
             try:
                 os.unlink(sock_path)
             except OSError:
                 pass
-        return reporter
 
     @work(thread=True, group="userdata")
     def refresh_after_play(self, item_ids: list[str]) -> None:
