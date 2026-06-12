@@ -789,6 +789,7 @@ class JTerm(App):
         self.cfg = load_config()
         if not self.cfg.get("device_id"):
             self.cfg["device_id"] = uuid.uuid4().hex
+        self.hwdec = bool(self.cfg.get("hwdec", False))
         self.jf: Jellyfin | None = None
         self.server_name = ""
         self.username = self.cfg.get("username") or ""
@@ -1177,6 +1178,14 @@ class JTerm(App):
             f"--user-agent={CLIENT_NAME}/{CLIENT_VERSION}",
         ]
 
+    def _decode_flags(self) -> list[str]:
+        """Decode flags shared by the video paths. With GPU decoding on we
+        let mpv pick a safe hardware decoder; otherwise the fast software
+        profile keeps CPU scaling cheap for terminal output."""
+        if self.hwdec:
+            return ["--hwdec=auto-safe"]
+        return ["--profile=sw-fast"]
+
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
         cols = shutil.get_terminal_size().columns
         bar = "─" * min(cols - 1, 110)
@@ -1218,10 +1227,11 @@ class JTerm(App):
             return None
         ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
         cmd += [
-            f"--vo={self.vo}", "--profile=sw-fast",
+            f"--vo={self.vo}",
             "--term-status-msg=",
             f"--video-margin-ratio-bottom={ratio:.4f}",
         ]
+        cmd += self._decode_flags()
         if self.vo == "kitty":
             cmd.append("--vo-kitty-use-shm=yes")
         if start_ticks:
@@ -1246,6 +1256,8 @@ class JTerm(App):
             cmd = self._mpv_base(sock_path)
             if cmd is None:
                 return
+            if self.hwdec:
+                cmd.append("--hwdec=auto-safe")
             if start_ticks:
                 cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
             cmd += [f"--title=jterm: {title}", self.jf.stream_url(item["Id"])]
