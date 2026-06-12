@@ -45,6 +45,7 @@ Just like the mobile app, the home screen shows:
 | `o`      | Open in an mpv window — browsing continues               |
 | `w`      | Toggle watched / unwatched                               |
 | `f`      | Toggle favourite                                         |
+| `d`      | Toggle GPU / hardware decoding (off by default)          |
 | `Esc`    | Back (also jumps from the search box to the list)        |
 | `g`      | Home screen                                              |
 | `Ctrl+r` | Refresh the current view                                 |
@@ -83,6 +84,15 @@ graphics protocol, full pixel resolution) when running in kitty, otherwise
 Playback is always direct play — the original file is streamed untouched
 (seekable via HTTP byte ranges), so nothing is transcoded on the server. For
 sharp video run jterm inside kitty, or press `o` for a real mpv window.
+
+## GPU / hardware decoding
+
+`d` toggles hardware decoding (`--hwdec=auto-safe`) on or off; the choice is
+remembered in the config and shown in the status line (`decode cpu`/`gpu`).
+It lowers CPU during decode and helps the `o` window most — for in-terminal
+video the decoded frames still copy back to the CPU to be drawn through the
+graphics protocol, so the gain there is smaller. Off by default: turn it on
+if playback is choppy or the CPU runs hot.
 
 ## Internals
 

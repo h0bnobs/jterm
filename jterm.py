@@ -70,6 +70,7 @@ HELP_TEXT = """\
   o        open in an mpv window (browse continues)
   w        toggle watched / unwatched
   f        toggle favourite
+  d        toggle GPU / hardware decoding (off by default)
   Esc      back (also jumps from the search box to the list)
   g        home screen
   ctrl+r   refresh the current view
@@ -91,6 +92,13 @@ HELP_TEXT = """\
   mobile app: resume points, watched ticks and Next Up all stay in sync.
   When playback ends you land back on the library or collection you
   were browsing, or Home.
+
+[b]GPU / hardware decoding[/b]
+  d toggles hardware decoding (--hwdec=auto-safe) on or off; the choice
+  is remembered. It lowers CPU during decode and helps the o window
+  most. For in-terminal video the frames still copy back to the CPU to
+  be drawn, so the gain there is smaller. Off by default — turn it on
+  if playback is choppy or CPU runs hot.
 """
 
 
