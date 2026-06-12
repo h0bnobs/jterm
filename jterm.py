@@ -41,6 +41,14 @@ DISCOVERY_MESSAGE = b"who is JellyfinServer?"
 DISCOVERY_TIMEOUT = 2.0
 PROGRESS_INTERVAL = 5.0
 PAGE_LIMIT = 200
+# Selectable quality caps, highest first. "source" is direct play of the
+# original file (the default); a height asks the server to transcode with
+# the bitrate mapped below. Some servers (Jellyfin 10.11 included) pick the
+# actual resolution from the bitrate rather than honouring maxHeight, so
+# the footer's live resolution readout is the truth.
+QUALITY_CAPS = ["source", 1080, 720, 480, 360]
+TRANSCODE_BITRATES = {1080: 8_000_000, 720: 4_000_000,
+                      480: 2_000_000, 360: 1_000_000}
 # The /Users/{id}/Items list endpoint serves UserData from a server-side
 # cache that lags writes by 30s or more, while the single-item endpoint is
 # always fresh. Freshly learned UserData is overlaid on list responses for
@@ -303,23 +311,44 @@ class Jellyfin:
 
     # -- playback ----------------------------------------------------------
 
-    def stream_url(self, item_id: str) -> str:
-        return (f"{self.server}/Videos/{item_id}/stream"
-                f"?static=true&api_key={self.token}&deviceId={self.device_id}")
+    def stream_url(self, item_id: str, max_height: int | None = None,
+                   start_ticks: int = 0, session_id: str | None = None) -> str:
+        """Direct-play URL by default; with max_height a server-side
+        transcode capped at that quality, optionally starting mid-item
+        (the transcoded stream's clock then starts at zero)."""
+        if max_height is None:
+            return (f"{self.server}/Videos/{item_id}/stream"
+                    f"?static=true&api_key={self.token}&deviceId={self.device_id}")
+        bitrate = TRANSCODE_BITRATES.get(max_height, 4_000_000)
+        url = (f"{self.server}/Videos/{item_id}/stream.mkv"
+               f"?static=false&api_key={self.token}&deviceId={self.device_id}"
+               f"&videoCodec=h264&audioCodec=aac"
+               f"&maxHeight={max_height}&videoBitRate={bitrate}")
+        if start_ticks:
+            url += f"&startTimeTicks={start_ticks}"
+        if session_id:
+            url += f"&PlaySessionId={session_id}"
+        return url
 
-    def report_start(self, item_id: str, session_id: str, ticks: int) -> None:
+    def stop_encoding(self, session_id: str) -> None:
+        """Tell the server to kill the transcode job for a play session."""
+        self.delete("/Videos/ActiveEncodings", {
+            "deviceId": self.device_id, "playSessionId": session_id})
+
+    def report_start(self, item_id: str, session_id: str, ticks: int,
+                     play_method: str = "DirectPlay") -> None:
         self.post("/Sessions/Playing", body={
             "ItemId": item_id, "PlaySessionId": session_id,
             "PositionTicks": ticks, "CanSeek": True,
-            "PlayMethod": "DirectPlay",
+            "PlayMethod": play_method,
         })
 
     def report_progress(self, item_id: str, session_id: str, ticks: int,
-                        paused: bool) -> None:
+                        paused: bool, play_method: str = "DirectPlay") -> None:
         self.post("/Sessions/Playing/Progress", body={
             "ItemId": item_id, "PlaySessionId": session_id,
             "PositionTicks": ticks, "IsPaused": paused,
-            "CanSeek": True, "PlayMethod": "DirectPlay",
+            "CanSeek": True, "PlayMethod": play_method,
         })
 
     def report_stopped(self, item_id: str, session_id: str, ticks: int) -> None:
@@ -351,13 +380,19 @@ class PlaybackReporter(threading.Thread):
     with the rest of the Jellyfin ecosystem.
     """
 
-    def __init__(self, jf: Jellyfin, item: dict, sock_path: str, start_ticks: int):
+    def __init__(self, jf: Jellyfin, item: dict, sock_path: str, start_ticks: int,
+                 offset_ticks: int = 0, play_method: str = "DirectPlay",
+                 session_id: str | None = None):
         super().__init__(daemon=True)
         self.jf = jf
         self.item = item
         self.sock_path = sock_path
-        self.session_id = uuid.uuid4().hex
+        self.session_id = session_id or uuid.uuid4().hex
         self.last_ticks = start_ticks
+        # a transcode started mid-item has its clock rebased to zero, so
+        # mpv's time-pos is offset_ticks behind the true position
+        self.offset_ticks = offset_ticks
+        self.play_method = play_method
         self._req_id = 0
         self._halt = threading.Event()
 
@@ -410,7 +445,7 @@ class PlaybackReporter(threading.Thread):
             return
         rfile = sock.makefile("r", encoding="utf-8", errors="replace")
         self._report(self.jf.report_start, self.item["Id"], self.session_id,
-                     self.last_ticks)
+                     self.last_ticks, self.play_method)
         try:
             while not self._halt.is_set():
                 try:
@@ -419,9 +454,10 @@ class PlaybackReporter(threading.Thread):
                 except (OSError, socket.timeout):
                     break
                 if isinstance(pos, (int, float)) and pos > 0:
-                    self.last_ticks = int(pos * TICKS_PER_SECOND)
+                    self.last_ticks = self.offset_ticks + int(pos * TICKS_PER_SECOND)
                 self._report(self.jf.report_progress, self.item["Id"],
-                             self.session_id, self.last_ticks, bool(paused))
+                             self.session_id, self.last_ticks, bool(paused),
+                             self.play_method)
                 if self._halt.wait(PROGRESS_INTERVAL):
                     break
         finally:
