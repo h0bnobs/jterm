@@ -68,11 +68,12 @@ That means:
 ## Playback control centre
 
 During playback a fixed, coloured two-row control footer sits at the bottom
-of the pane: position / duration / volume plus the key hints (`q` quit,
-`space` pause, `←/→` seek 5 s, `↑/↓` seek 1 min, `9/0` volume, `m` mute,
-`[ ]` speed). The footer is updated live over mpv's IPC socket, and the
-video is kept out of its rows with a reserved bottom margin, so it can
-never be drawn over — including when the pane is resized mid-playback.
+of the pane: position / duration / volume / live resolution / quality cap
+plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s, `↑/↓` seek
+1 min, `Ctrl+↑/↓` quality, `9/0` volume, `m` mute, `[ ]` speed). The footer
+is updated live over mpv's IPC socket, and the video is kept out of its
+rows with a reserved bottom margin, so it can never be drawn over —
+including when the pane is resized mid-playback.
 
 ## Video output and quality
 
@@ -81,9 +82,19 @@ graphics protocol, full pixel resolution) when running in kitty, otherwise
 `tct` true-colour half-blocks which work in any terminal. Override with
 `JTERM_VO=kitty|tct jterm`.
 
-Playback is always direct play — the original file is streamed untouched
+By default playback is direct play — the original file is streamed untouched
 (seekable via HTTP byte ranges), so nothing is transcoded on the server. For
 sharp video run jterm inside kitty, or press `o` for a real mpv window.
+
+`Ctrl+↑/↓` during playback steps a quality cap across source / 1080 / 720 /
+480 / 360. Anything below source asks the server to transcode (h264/aac at a
+bitrate mapped from the cap), reloading the stream in place at the current
+position; the choice is remembered for next time. Notes: transcoding costs
+server CPU; some servers (Jellyfin 10.11 among them) pick the transcode
+resolution from the bitrate rather than the requested height, so trust the
+footer's live resolution readout; seeking far ahead of a transcode can stall
+while the server catches up; and if a transcode fails outright jterm falls
+back to source quality with a note in the footer.
 
 ## GPU / hardware decoding
 
