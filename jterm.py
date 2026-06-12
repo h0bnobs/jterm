@@ -910,6 +910,8 @@ class JTerm(App):
         Binding("b", "play_beginning", "From start", show=False),
         Binding("a", "play_audio", "Audio", show=False),
         Binding("o", "play_window", "Window"),
+        Binding("e", "enqueue_window", "Enqueue", show=False),
+        Binding("x", "stop_window", "Stop win", show=False),
         Binding("w", "toggle_watched", "Watched"),
         Binding("f", "toggle_favourite", "Fav", show=False),
         Binding("d", "toggle_hwdec", "GPU", show=False),
@@ -1246,6 +1248,42 @@ class JTerm(App):
 
     def action_play_window(self) -> None:
         self._play_selected("window")
+
+    def action_enqueue_window(self) -> None:
+        if self.in_input():
+            return
+        sel = self.selected()
+        if not sel:
+            return
+        _section, item = sel
+        if is_folder(item):
+            self.set_status("that is a folder — press Enter to open it")
+            return
+        self._window_play(item, resume_ticks(item), append=True)
+
+    def action_stop_window(self) -> None:
+        if self.in_input():
+            return
+        if self._win_proc and self._win_proc.poll() is None:
+            if self._win_reporter:
+                self._win_reporter.stop()       # reports stopped to the server
+                self._win_reporter.join(timeout=10)
+            if self._win_sock:
+                try:
+                    ipc = MpvIPC(self._win_sock)
+                    ipc.command(["quit"])
+                    ipc.close()
+                except OSError:
+                    pass
+            try:
+                self._win_proc.wait(timeout=3)
+            except Exception:
+                self._win_proc.terminate()
+            self.set_status("stopped the window player")
+        else:
+            self.set_status("no window player is running")
+        self._win_proc = self._win_sock = self._win_title = None
+        self._win_reporter = None
 
     def _play_selected(self, mode: str, from_start: bool = False) -> None:
         if self.in_input():
