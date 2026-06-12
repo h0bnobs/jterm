@@ -774,6 +774,7 @@ class JTerm(App):
         Binding("o", "play_window", "Window"),
         Binding("w", "toggle_watched", "Watched"),
         Binding("f", "toggle_favourite", "Fav", show=False),
+        Binding("d", "toggle_hwdec", "GPU", show=False),
         Binding("escape", "back", "Back"),
         Binding("backspace", "back", "Back", show=False),
         Binding("g", "home", "Home"),
@@ -832,7 +833,8 @@ class JTerm(App):
             vo += " (block art — run jterm inside kitty for sharp video)"
         where = f"{self.server_name} · {self.username}" if self.jf else "not connected"
         path = " › ".join(p.title for p in self.stack)
-        bits = [where, f"video: {vo}", path or "", extra]
+        decode = "gpu" if self.hwdec else "cpu"
+        bits = [where, f"video: {vo} · decode {decode}", path or "", extra]
         self.set_status(" │ ".join(b for b in bits if b))
 
     def in_input(self) -> bool:
@@ -1130,6 +1132,20 @@ class JTerm(App):
         _s, item = sel
         fav = bool((item.get("UserData") or {}).get("IsFavorite"))
         self.run_userdata(item, "favourite", not fav)
+
+    def action_toggle_hwdec(self) -> None:
+        if self.in_input():
+            return
+        self.hwdec = not self.hwdec
+        self.cfg["hwdec"] = self.hwdec
+        save_config(self.cfg)
+        if self.hwdec:
+            self.set_status(
+                "GPU/hardware decoding on — lower CPU on decode and in the o "
+                "window; in-terminal frames still copy back to the CPU. "
+                "Applies to the next play.")
+        else:
+            self.set_status("GPU/hardware decoding off — software decode (sw-fast)")
 
     @work(thread=True, group="userdata")
     def run_userdata(self, item: dict, what: str, value: bool) -> None:
