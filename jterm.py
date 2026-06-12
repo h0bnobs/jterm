@@ -15,6 +15,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -512,6 +513,100 @@ def is_folder(item: dict) -> bool:
 
 def resume_ticks(item: dict) -> int:
     return (item.get("UserData") or {}).get("PlaybackPositionTicks") or 0
+
+
+# --------------------------------------------------------------------------
+# In-terminal video layout: a fixed, coloured control footer that mpv is
+# kept out of via a reserved bottom video margin (issue #1)
+# --------------------------------------------------------------------------
+
+FOOTER_ROWS = 2
+FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
+FOOTER_FG = "\x1b[38;2;236;236;245m"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+
+
+def footer_margin_ratio(lines: int) -> float:
+    """Fraction of the video area to reserve so the footer's rows stay clear.
+    Recomputed from the live terminal height so a resize keeps it exact."""
+    return round(FOOTER_ROWS / max(lines, FOOTER_ROWS + 1), 4)
+
+
+def footer_lines(st: dict, title: str, cols: int) -> list[str]:
+    """The two text lines shown in the control footer."""
+    icon = "⏸" if st.get("pause") else "▶"
+    pos = fmt_clock(st["time-pos"]) if st.get("time-pos") is not None else "0:00"
+    dur = fmt_clock(st["duration"]) if st.get("duration") else "?"
+    pct = f"{int(st['percent-pos'])}%" if st.get("percent-pos") is not None else "0%"
+    vol = f"{int(st['volume'])}" if st.get("volume") is not None else "?"
+    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {title}"
+    return [line1, " " + KEY_HINTS]
+
+
+def draw_footer(lines_text: list[str], term_lines: int, cols: int) -> None:
+    """Paint the coloured footer band across its reserved bottom rows.
+    Autowrap is disabled so filling the final cell never scrolls."""
+    out = ["\x1b[?7l"]
+    first = term_lines - len(lines_text) + 1
+    for i, text in enumerate(lines_text):
+        cell = (text[:cols]).ljust(cols)
+        out.append(f"\x1b[{first + i};1H{FOOTER_BG}{FOOTER_FG}{cell}\x1b[0m")
+    out.append("\x1b[?7h")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+class MpvIPC:
+    """Tiny JSON-IPC client for a running mpv (--input-ipc-server)."""
+
+    def __init__(self, path: str):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(path)
+        self.sock.settimeout(0.4)
+        self.buf = b""
+        self._rid = 0
+
+    def get(self, prop: str):
+        self._rid += 1
+        rid = self._rid
+        try:
+            self.sock.sendall(
+                json.dumps({"command": ["get_property", prop], "request_id": rid}).encode() + b"\n"
+            )
+        except OSError:
+            return None
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            try:
+                self.buf += self.sock.recv(65536)
+            except socket.timeout:
+                break
+            except OSError:
+                return None
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("request_id") == rid:
+                    return msg.get("data") if msg.get("error") == "success" else None
+        return None
+
+    def command(self, cmd: list) -> None:
+        """Fire a command without waiting for its reply."""
+        try:
+            self.sock.sendall(json.dumps({"command": cmd}).encode() + b"\n")
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
