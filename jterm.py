@@ -499,6 +499,67 @@ class PlaybackReporter(threading.Thread):
                          self.session_id, self.last_ticks)
 
 
+class WindowReporter(PlaybackReporter):
+    """Reporter for the reusable window player.
+
+    The window outlives any single item (o replaces, e enqueues, the
+    playlist advances by itself), so this follows whatever mpv is
+    actually playing: each poll reads the current path, and when it moves
+    to a different tracked item the old one is reported stopped and the
+    new one started under a fresh play session.
+    """
+
+    def __init__(self, jf: Jellyfin, sock_path: str):
+        super().__init__(jf, {}, sock_path, 0)
+        self._tracked: dict[str, tuple[dict, int]] = {}  # url -> (item, start ticks)
+
+    def track(self, url: str, item: dict, start_ticks: int) -> None:
+        self._tracked[url] = (item, start_ticks)
+
+    def run(self) -> None:
+        sock = self._connect()
+        if sock is None:
+            return
+        rfile = sock.makefile("r", encoding="utf-8", errors="replace")
+        try:
+            while not self._halt.is_set():
+                try:
+                    path = self._get_property(sock, rfile, "path")
+                    pos = self._get_property(sock, rfile, "time-pos")
+                    paused = self._get_property(sock, rfile, "pause")
+                except (OSError, socket.timeout):
+                    break
+                entry = self._tracked.get(path) if path else None
+                new_item = entry[0] if entry else None
+                if (new_item or {}).get("Id") != (self.item or {}).get("Id"):
+                    self._switch(new_item, entry[1] if entry else 0)
+                if self.item:
+                    if isinstance(pos, (int, float)) and pos > 0:
+                        self.last_ticks = int(pos * TICKS_PER_SECOND)
+                    self._report(self.jf.report_progress, self.item["Id"],
+                                 self.session_id, self.last_ticks, bool(paused))
+                if self._halt.wait(PROGRESS_INTERVAL):
+                    break
+        finally:
+            try:
+                rfile.close()
+                sock.close()
+            except OSError:
+                pass
+            self._switch(None, 0)
+
+    def _switch(self, new_item: dict | None, start_ticks: int) -> None:
+        if self.item:
+            self._report(self.jf.report_stopped, self.item["Id"],
+                         self.session_id, self.last_ticks)
+        self.item = new_item
+        if new_item:
+            self.session_id = uuid.uuid4().hex
+            self.last_ticks = start_ticks
+            self._report(self.jf.report_start, new_item["Id"],
+                         self.session_id, start_ticks)
+
+
 # --------------------------------------------------------------------------
 # Formatting helpers
 # --------------------------------------------------------------------------
@@ -876,6 +937,12 @@ class JTerm(App):
         self.stack: list[Page] = []
         # item id -> (monotonic time, fresh UserData) — see UD_PATCH_TTL
         self._ud_patch: dict[str, tuple[float, dict]] = {}
+        # A single reusable mpv window driven over IPC, so the TUI stays
+        # interactive for browsing while a video plays (issue #5).
+        self._win_proc: subprocess.Popen | None = None
+        self._win_sock: str | None = None
+        self._win_title: str | None = None
+        self._win_reporter: WindowReporter | None = None
 
     # -- layout --------------------------------------------------------------
 
@@ -914,6 +981,8 @@ class JTerm(App):
         path = " › ".join(p.title for p in self.stack)
         decode = "gpu" if self.hwdec else "cpu"
         bits = [where, f"video: {vo} · decode {decode}", path or "", extra]
+        if self._win_proc and self._win_proc.poll() is None and self._win_title:
+            bits.insert(0, f"▶ window: {self._win_title[:30]} (x stop)")
         self.set_status(" │ ".join(b for b in bits if b))
 
     def in_input(self) -> bool:
@@ -1305,6 +1374,86 @@ class JTerm(App):
                 return ep
         return None
 
+    # -- reusable window player (search while playing, issue #5) ------------
+
+    def _window_play(self, item: dict, start_ticks: int, append: bool = False) -> None:
+        """Play in a single reusable mpv window. If one is already running
+        we drive it over IPC (replace, or append-play to queue) so the TUI
+        stays available; otherwise we spawn the window. The WindowReporter
+        follows whichever tracked item the window is actually playing."""
+        title = self._display_title(item)
+        url = self.jf.stream_url(item["Id"])
+        if self._win_proc and self._win_proc.poll() is None and \
+                self._window_loadfile(url, start_ticks, append, title):
+            if self._win_reporter:
+                self._win_reporter.track(url, item, start_ticks)
+            if not append:
+                self._win_title = title
+            verb = "queued" if append else "now playing"
+            self.set_status(f"{verb} in window: {title[:55]} — browsing stays live")
+            return
+        self._spawn_window(url, title, item, start_ticks)
+
+    def _window_loadfile(self, url: str, start_ticks: int, append: bool,
+                         title: str) -> bool:
+        """Tell the running window to load a URL. Returns False if it could
+        not be reached, so the caller can spawn a fresh window instead."""
+        sock = self._win_sock
+        if not sock:
+            return False
+        mode = "append-play" if append else "replace"
+        deadline = time.time() + 1.5  # the socket may lag a just-spawned mpv
+        while time.time() < deadline:
+            if os.path.exists(sock):
+                try:
+                    ipc = MpvIPC(sock)
+                except OSError:
+                    time.sleep(0.1)
+                    continue
+                args = ["loadfile", url, mode]
+                if start_ticks:
+                    # 3rd arg is the options string on mpv <= 0.37
+                    args.append(f"start={start_ticks // TICKS_PER_SECOND}")
+                ipc.command(args)
+                if not append:
+                    ipc.command(["set_property", "title", f"jterm ▶ {title}"])
+                ipc.close()
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _spawn_window(self, url: str, title: str, item: dict,
+                      start_ticks: int) -> None:
+        sock = os.path.join(tempfile.gettempdir(),
+                            f"jterm-window-{os.getpid()}.sock")
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        cmd = self._mpv_base(sock)
+        if cmd is None:
+            return
+        if self.hwdec:
+            cmd.append("--hwdec=auto-safe")
+        cmd += [
+            "--idle=yes", "--force-window=yes",  # persist between videos
+            f"--title=jterm ▶ {title}",
+        ]
+        if start_ticks:
+            cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
+        cmd.append(url)
+        self._win_proc = subprocess.Popen(
+            cmd, start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._win_sock = sock
+        self._win_title = title
+        self._win_reporter = WindowReporter(self.jf, sock)
+        self._win_reporter.track(url, item, start_ticks)
+        self._win_reporter.start()
+        self.set_status(f"now playing in window: {title[:55]} — browsing stays live")
+
     @staticmethod
     def _new_sock_path() -> str:
         return os.path.join(
@@ -1348,22 +1497,7 @@ class JTerm(App):
         title = self._display_title(item)
 
         if mode == "window":
-            sock_path = self._new_sock_path()
-            cmd = self._mpv_base(sock_path)
-            if cmd is None:
-                return
-            if self.hwdec:
-                cmd.append("--hwdec=auto-safe")
-            if start_ticks:
-                cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
-            cmd += [f"--title=jterm: {title}", self.jf.stream_url(item["Id"])]
-            PlaybackReporter(self.jf, item, sock_path, start_ticks).start()
-            subprocess.Popen(
-                cmd, start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            self.set_status(f"playing in window: {title[:60]} (browse continues)")
+            self._window_play(item, start_ticks)
             return
 
         played_ids: list[str] = []
