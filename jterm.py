@@ -35,10 +35,17 @@ from textual.widgets.option_list import Option
 CONFIG_PATH = os.path.expanduser("~/.config/jterm/config.json")
 INPUT_CONF_PATH = os.path.expanduser("~/.config/jterm/input.conf")
 # Ctrl+Up/Down change the quality cap by signalling jterm through an mpv
-# user-data property. Everything else keeps mpv defaults.
+# user-data property; n/b step to the next/previous episode the same way
+# (Ctrl+Right/Left as alternates for terminals that eat plain letters).
+# Everything else keeps mpv defaults. These bindings only exist inside mpv
+# during playback, so they never clash with the browser's keys.
 INPUT_CONF = (
     "Ctrl+UP set user-data/jterm/req up\n"
     "Ctrl+DOWN set user-data/jterm/req down\n"
+    "n set user-data/jterm/req next\n"
+    "b set user-data/jterm/req prev\n"
+    "Ctrl+RIGHT set user-data/jterm/req next\n"
+    "Ctrl+LEFT set user-data/jterm/req prev\n"
 )
 CLIENT_NAME = "jterm"
 CLIENT_VERSION = "0.1.0"
@@ -665,7 +672,7 @@ def resume_ticks(item: dict) -> int:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · ⌃↑/↓ quality · m mute · [ ] speed"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · ⌃↑/↓ quality · n/b next/prev ep · m mute"
 
 
 def footer_margin_ratio(lines: int) -> float:
@@ -1640,6 +1647,7 @@ class JTerm(App):
         cap, preserving the position; each (re)launch gets a fresh reporter
         so resume positions and watched state stay correct throughout."""
         sock_path = self._new_sock_path()
+        current = item            # rebound by the manual n/b episode keys
         title = self._display_title(item)
         runtime = (item.get("RunTimeTicks") or 0) / TICKS_PER_SECOND
         played_ids.append(item["Id"])
@@ -1673,18 +1681,18 @@ class JTerm(App):
                         size.lines, size.columns)
             session_id = uuid.uuid4().hex
             if cap == "source":
-                url = self.jf.stream_url(item["Id"])
+                url = self.jf.stream_url(current["Id"])
                 cmd = self._video_cmd(url, pos_ticks, sock_path)
                 offset_ticks = 0
             else:
-                url = self.jf.stream_url(item["Id"], cap, pos_ticks, session_id)
+                url = self.jf.stream_url(current["Id"], cap, pos_ticks, session_id)
                 cmd = self._video_cmd(url, 0, sock_path)
                 offset_ticks = pos_ticks
             if cmd is None:
                 return None, None, 0.0
             proc = subprocess.Popen(cmd)
             reporter = PlaybackReporter(
-                self.jf, item, sock_path, pos_ticks,
+                self.jf, current, sock_path, pos_ticks,
                 offset_ticks=offset_ticks,
                 play_method="DirectPlay" if cap == "source" else "Transcode",
                 session_id=session_id)
@@ -1757,6 +1765,28 @@ class JTerm(App):
                             proc, ipc, new_cap, int(pos * TICKS_PER_SECOND))
                         launched_at = time.time()
                         last_lines = None
+                    continue
+
+                if req in ("next", "prev"):
+                    ipc.command(["set_property", "user-data/jterm/req", "none"])
+                    draw_footer([" looking up the episode…", " " + KEY_HINTS],
+                                size.lines, size.columns)
+                    nxt = (self._next_episode(current) if req == "next"
+                           else self._prev_episode(current))
+                    if nxt is None:
+                        word = "next" if req == "next" else "previous"
+                        draw_footer([f" no {word} episode", " " + KEY_HINTS],
+                                    size.lines, size.columns)
+                        time.sleep(1.2)
+                        continue
+                    current = nxt
+                    title = self._display_title(current)
+                    runtime = (current.get("RunTimeTicks") or 0) / TICKS_PER_SECOND
+                    played_ids.append(current["Id"])
+                    proc, ipc, offset = relaunch(proc, ipc, self.quality_cap,
+                                                 resume_ticks(current))
+                    launched_at = time.time()
+                    last_lines = None
                     continue
 
                 # a transcode plays a partial, clock-rebased stream: shift
