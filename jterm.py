@@ -57,6 +57,9 @@ FOLDER_TYPES = {
     "CollectionFolder", "UserView", "Folder", "BoxSet", "Series", "Season",
     "MusicAlbum", "Playlist",
 }
+# Page sources counted as a library/collection for the end-of-playback
+# "return to where you were browsing" behaviour.
+LIBRARY_TYPES = {"CollectionFolder", "UserView", "BoxSet"}
 
 HELP_TEXT = """\
 [b]Browsing[/b]
@@ -734,10 +737,12 @@ class HelpScreen(ModalScreen):
 class Page:
     """One level of the navigation stack."""
 
-    def __init__(self, title: str, loader, rows: list[tuple[str, dict]] | None = None):
+    def __init__(self, title: str, loader,
+                 source: dict | None = None):
         self.title = title
         self.loader = loader          # callable -> list[(section, item)]
-        self.rows = rows or []
+        self.source = source          # the item this page was opened from
+        self.rows: list[tuple[str, dict]] = []
         self.cursor = 0
 
 
@@ -960,10 +965,10 @@ class JTerm(App):
 
     # -- page loading ----------------------------------------------------------
 
-    def push_page(self, title: str, loader) -> None:
+    def push_page(self, title: str, loader, source: dict | None = None) -> None:
         if self.stack:
             self.stack[-1].cursor = self.query_one(DataTable).cursor_row or 0
-        self.stack.append(Page(title, loader))
+        self.stack.append(Page(title, loader, source))
         self.query_one(DataTable).loading = True
         self.set_status(f"loading {title}…")
         self.load_page(self.stack[-1], False)
@@ -1073,7 +1078,7 @@ class JTerm(App):
             return
         _section, item = sel
         if is_folder(item):
-            self.push_page(item.get("Name") or "?", self._loader_children(item))
+            self.push_page(item.get("Name") or "?", self._loader_children(item), item)
         else:
             self._play("terminal", item, resume_ticks(item))
 
@@ -1259,7 +1264,25 @@ class JTerm(App):
             except KeyboardInterrupt:
                 pass
         self.set_status(f"finished: {title[:60]}")
+        self._return_to_parent()
         self.refresh_after_play(played_ids)
+
+    def _return_to_parent(self) -> None:
+        """After playback ends, land back on the page you were browsing
+        from: the nearest ancestor library or collection, or Home when the
+        item came from Home, Continue Watching, Next Up or a search."""
+        if not self.stack:
+            return
+        keep = 0  # Home
+        for i, page in enumerate(self.stack):
+            if (page.source or {}).get("Type") in LIBRARY_TYPES:
+                keep = i
+        if keep == len(self.stack) - 1:
+            # already on the right page — keep the cursor where it was
+            page = self.stack[-1]
+            page.cursor = self.query_one(DataTable).cursor_row or page.cursor
+        else:
+            del self.stack[keep + 1:]
 
     def _play_audio(self, item: dict, start_ticks: int,
                     played_ids: list[str]) -> None:
@@ -1355,7 +1378,10 @@ class JTerm(App):
                                    (self.jf.item(item_id) or {}).get("UserData"))
             except JFError:
                 pass
-        self.call_from_thread(self.reload_page)
+        if self.stack:
+            # not reload_page: the table may still show a deeper page after
+            # _return_to_parent, so its cursor must not overwrite this one
+            self.call_from_thread(self.load_page, self.stack[-1], True)
 
 
 def main() -> None:
