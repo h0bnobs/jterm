@@ -82,7 +82,10 @@ HELP_TEXT = """\
   Enter    open folder / play (resumes where you left off)
   b        play from the beginning
   a        play audio only
-  o        open in an mpv window (browse continues)
+  o        play in the reusable mpv window (replaces it) — the TUI
+           stays live for browsing and searching
+  e        enqueue the selected item after the one in the window
+  x        stop the window player
   w        toggle watched / unwatched
   f        toggle favourite
   d        toggle GPU / hardware decoding (off by default)
@@ -118,6 +121,13 @@ HELP_TEXT = """\
   mobile app: resume points, watched ticks and Next Up all stay in sync.
   When playback ends you land back on the library or collection you
   were browsing, or Home.
+
+[b]Browse while playing[/b]
+  Enter takes over the terminal, so to keep browsing press o to play in
+  a reusable mpv window instead. The TUI stays live: search, then o on
+  another result to swap it into the same window, or e to queue it
+  next. x stops the window. Progress syncs for whichever item the
+  window is playing, and the status bar shows what that is.
 
 [b]GPU / hardware decoding[/b]
   d toggles hardware decoding (--hwdec=auto-safe) on or off; the choice
