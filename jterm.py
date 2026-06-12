@@ -1204,25 +1204,28 @@ class JTerm(App):
             tempfile.gettempdir(),
             f"jterm-mpv-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock")
 
-    def _term_cmd(self, mode: str) -> tuple[list[str], str] | None:
-        """Build the in-terminal mpv command and a fresh IPC socket path."""
-        sock_path = self._new_sock_path()
+    def _video_cmd(self, url: str, start_ticks: int, sock_path: str) -> list[str] | None:
+        """Build the in-terminal mpv command with the footer band reserved.
+
+        --video-margin-ratio-bottom physically keeps the video out of the
+        footer's rows (unlike --vo-kitty-rows, which only overrides mpv's
+        size detection and lets the image draw over the band anyway).
+        """
         cmd = self._mpv_base(sock_path)
         if cmd is None:
             return None
-        cmd.append(f"--term-status-msg={MPV_STATUS}")
-        if mode == "audio":
-            cmd.append("--no-video")
-        else:
-            size = shutil.get_terminal_size()
-            video_rows = max(size.lines - 2, 4)
-            cmd += [f"--vo={self.vo}", "--profile=sw-fast"]
-            if self.vo == "tct":
-                cmd.append(f"--vo-tct-height={video_rows}")
-            elif self.vo == "kitty":
-                cmd += ["--vo-kitty-use-shm=yes",
-                        f"--vo-kitty-rows={video_rows}", "--vo-kitty-top=1"]
-        return cmd, sock_path
+        ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
+        cmd += [
+            f"--vo={self.vo}", "--profile=sw-fast",
+            "--term-status-msg=",
+            f"--video-margin-ratio-bottom={ratio:.4f}",
+        ]
+        if self.vo == "kitty":
+            cmd.append("--vo-kitty-use-shm=yes")
+        if start_ticks:
+            cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
+        cmd.append(url)
+        return cmd
 
     @staticmethod
     def _display_title(item: dict) -> str:
@@ -1253,53 +1256,122 @@ class JTerm(App):
             self.set_status(f"playing in window: {title[:60]} (browse continues)")
             return
 
-        mode_desc = ("audio only" if mode == "audio"
-                     else f"video {self.vo} · direct play")
         played_ids: list[str] = []
         with self.suspend():
-            current, current_start, current_title = item, start_ticks, title
-            while True:
-                built = self._term_cmd(mode)
-                if built is None:
-                    break
-                cmd, sock_path = built
-                if current_start:
-                    cmd.append(f"--start={current_start // TICKS_PER_SECOND}")
-                cmd.append(self.jf.stream_url(current["Id"]))
-
-                os.system("clear")
-                desc = mode_desc
-                if current_start:
-                    desc += f" │ resuming from {fmt_clock(current_start / TICKS_PER_SECOND)}"
-                self._print_control_centre(current_title, desc)
-
-                reporter = PlaybackReporter(self.jf, current, sock_path, current_start)
-                reporter.start()
-                try:
-                    subprocess.call(cmd)
-                except KeyboardInterrupt:
-                    pass
-                reporter.stop()
-                reporter.join(timeout=10)
-                played_ids.append(current["Id"])
-                title = current_title
-
-                # autoplay the next episode if this one was watched to the end
-                nxt = None
-                if reporter.watched_ratio() >= FINISHED_RATIO:
-                    nxt = self._next_episode(current)
-                if not nxt:
-                    break
-                nxt_title = self._display_title(nxt)
-                print(f"\n▶ up next: {nxt_title}  (starting in 3s — Ctrl-C to cancel)")
-                try:
-                    time.sleep(3)
-                except KeyboardInterrupt:
-                    break
-                current, current_start, current_title = nxt, resume_ticks(nxt), nxt_title
-
+            os.system("clear")
+            try:
+                if mode == "audio":
+                    self._play_audio(item, start_ticks, played_ids)
+                else:
+                    self._play_video(item, start_ticks, played_ids)
+            except KeyboardInterrupt:
+                pass
         self.set_status(f"finished: {title[:60]}")
         self.refresh_after_play(played_ids)
+
+    def _play_audio(self, item: dict, start_ticks: int,
+                    played_ids: list[str]) -> None:
+        """Audio has no video to overdraw, so the static banner plus mpv's
+        own status line is still the right tool."""
+        sock_path = self._new_sock_path()
+        cmd = self._mpv_base(sock_path)
+        if cmd is None:
+            return
+        cmd += [f"--term-status-msg={MPV_STATUS}", "--no-video"]
+        if start_ticks:
+            cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
+        cmd.append(self.jf.stream_url(item["Id"]))
+        desc = "audio only"
+        if start_ticks:
+            desc += f" │ resuming from {fmt_clock(start_ticks / TICKS_PER_SECOND)}"
+        self._print_control_centre(self._display_title(item), desc)
+        reporter = PlaybackReporter(self.jf, item, sock_path, start_ticks)
+        reporter.start()
+        played_ids.append(item["Id"])
+        try:
+            subprocess.call(cmd)
+        finally:
+            reporter.stop()
+            reporter.join(timeout=10)
+
+    def _play_video(self, item: dict, start_ticks: int,
+                    played_ids: list[str]) -> None:
+        current, current_start = item, start_ticks
+        while True:
+            reporter = self._run_mpv_with_footer(current, current_start, played_ids)
+            if reporter is None:
+                return
+            # autoplay the next episode if this one was watched to the end
+            nxt = None
+            if reporter.watched_ratio() >= FINISHED_RATIO:
+                nxt = self._next_episode(current)
+            if not nxt:
+                return
+            size = shutil.get_terminal_size()
+            draw_footer(
+                [f" ▶ up next: {self._display_title(nxt)}  (3s — Ctrl-C to cancel)",
+                 " " + KEY_HINTS], size.lines, size.columns)
+            time.sleep(3)  # Ctrl-C propagates to _play and cancels
+            current, current_start = nxt, resume_ticks(nxt)
+
+    def _run_mpv_with_footer(self, item: dict, start_ticks: int,
+                             played_ids: list[str]) -> PlaybackReporter | None:
+        """Launch mpv on the item and paint the live control footer until it
+        exits. The footer loop and the PlaybackReporter are independent
+        clients of the same mpv IPC socket: the loop owns the process and
+        the screen, the reporter mirrors progress to the server."""
+        sock_path = self._new_sock_path()
+        title = self._display_title(item)
+        size = shutil.get_terminal_size()
+        draw_footer([" loading…", " " + KEY_HINTS], size.lines, size.columns)
+        cmd = self._video_cmd(self.jf.stream_url(item["Id"]), start_ticks, sock_path)
+        if cmd is None:
+            return None
+        proc = subprocess.Popen(cmd)
+        reporter = PlaybackReporter(self.jf, item, sock_path, start_ticks)
+        reporter.start()
+        played_ids.append(item["Id"])
+        ipc = None
+        deadline = time.time() + 15
+        while time.time() < deadline and proc.poll() is None:
+            if os.path.exists(sock_path):
+                try:
+                    ipc = MpvIPC(sock_path)
+                    break
+                except OSError:
+                    pass
+            time.sleep(0.15)
+        props = ("time-pos", "duration", "percent-pos", "volume", "pause")
+        last_lines = None
+        try:
+            while proc.poll() is None:
+                size = shutil.get_terminal_size()
+                # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as
+                # the pane is resized, so the video can never creep over it.
+                if ipc and size.lines != last_lines:
+                    ipc.command(["set_property", "video-margin-ratio-bottom",
+                                 footer_margin_ratio(size.lines)])
+                    last_lines = size.lines
+                st = {p: ipc.get(p) for p in props} if ipc else {}
+                draw_footer(footer_lines(st, title, size.columns),
+                            size.lines, size.columns)
+                time.sleep(0.25)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if ipc:
+                ipc.close()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.terminate()
+            reporter.stop()
+            reporter.join(timeout=10)
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+        return reporter
 
     @work(thread=True, group="userdata")
     def refresh_after_play(self, item_ids: list[str]) -> None:
