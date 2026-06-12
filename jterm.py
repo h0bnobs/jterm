@@ -94,13 +94,24 @@ HELP_TEXT = """\
   q        quit
 
 [b]During playback (mpv owns the terminal)[/b]
-  A live control footer sits under the video with position, duration
-  and volume — the video can never draw over it, even when resizing.
+  A live control footer sits under the video with position, duration,
+  volume, resolution and the quality cap — the video can never draw
+  over it, even when resizing.
   q        stop (position is saved to the server)
   space    pause / resume
   ←/→      seek 5 s        ↑/↓   seek 1 min
+  Ctrl+↑/↓ raise / lower quality (reloads in place, keeps position)
   9/0      volume          m     mute
   [ / ]    playback speed  ,/.   frame step (paused)
+
+[b]Quality[/b]
+  The footer shows the live resolution. Ctrl+↑/↓ step the cap across
+  source / 1080 / 720 / 480 / 360: anything below source asks the
+  server to transcode (which costs server CPU), and the choice is
+  remembered. Some servers pick the transcode resolution from the
+  bitrate rather than the cap — the footer readout is the truth.
+  Seeking far ahead in a transcoded stream can stall while the server
+  catches up; direct play (source) seeks instantly.
 
 [b]Sync[/b]
   Progress is reported to Jellyfin every few seconds, exactly like the
