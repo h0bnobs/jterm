@@ -1455,6 +1455,10 @@ class JTerm(App):
                 ipc.command(args)
                 if not append:
                     ipc.command(["set_property", "title", f"jterm ▶ {title}"])
+                # commands are processed in order per connection, so a
+                # round-trip ensures they all landed before we disconnect
+                # (mpv drops still-queued lines when the client goes away)
+                ipc.get("pid")
                 ipc.close()
                 return True
             time.sleep(0.1)
