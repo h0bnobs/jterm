@@ -1409,18 +1409,29 @@ class JTerm(App):
         print(f" {mode_desc}"[: cols - 1])
         print(bar)
 
-    def _next_episode(self, item: dict) -> dict | None:
+    def _adjacent_episode(self, item: dict, direction: int) -> dict | None:
+        """The episode before (-1) or after (+1) this one in its series,
+        crossing season boundaries. None at either end or for non-episodes
+        (movies have no sequence)."""
         if item.get("Type") != "Episode" or not item.get("SeriesId"):
             return None
         try:
-            eps = self.jf.episodes(item["SeriesId"],
-                                   start_item_id=item["Id"], limit=2)
+            eps = self.jf.episodes(item["SeriesId"])
         except JFError:
             return None
-        for ep in eps:
-            if ep.get("Id") != item["Id"]:
-                return ep
+        ids = [e.get("Id") for e in eps]
+        if item["Id"] not in ids:
+            return None
+        i = ids.index(item["Id"]) + direction
+        if 0 <= i < len(eps):
+            return eps[i]
         return None
+
+    def _next_episode(self, item: dict) -> dict | None:
+        return self._adjacent_episode(item, 1)
+
+    def _prev_episode(self, item: dict) -> dict | None:
+        return self._adjacent_episode(item, -1)
 
     # -- reusable window player (search while playing, issue #5) ------------
 
