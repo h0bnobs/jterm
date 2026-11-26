@@ -47,7 +47,7 @@ Just like the mobile app, the home screen shows:
 | `x`      | Stop the window player                                   |
 | `w`      | Toggle watched / unwatched                               |
 | `f`      | Toggle favourite                                         |
-| `d`      | Toggle GPU / hardware decoding (off by default)          |
+| `d`      | Toggle GPU / hardware decoding (on by default)           |
 | `Esc`    | Back (also jumps from the search box to the list)        |
 | `g`      | Home screen                                              |
 | `Ctrl+r` | Refresh the current view                                 |
@@ -72,12 +72,20 @@ That means:
 ## Playback control centre
 
 During playback a fixed, coloured two-row control footer sits at the bottom
-of the pane: position / duration / volume / live resolution / quality cap
-plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s, `↑/↓` seek
-1 min, `Ctrl+↑/↓` quality, `n`/`b` next/previous episode, `9/0` volume,
-`m` mute, `[ ]` speed). The footer is updated live over mpv's IPC socket,
-and the video is kept out of its rows with a reserved bottom margin, so it
-can never be drawn over — including when the pane is resized mid-playback.
+of the pane: position / duration / volume / live resolution / quality cap /
+subtitle state plus the key hints (`q` quit, `space` pause, `←/→` seek 5 s,
+`↑/↓` volume, `Ctrl+↑/↓` quality, `n`/`b` next/previous episode, `v`
+subtitles on/off, `j`/`J` cycle subtitle track, `m` mute, `[ ]` speed). The
+footer is updated live over mpv's IPC socket, and the video is kept out of
+its rows with a reserved bottom margin. The footer is pinned to the real
+terminal bottom read straight from the tty, so it stays put and can never be
+drawn over — including when the pane is split or resized mid-playback.
+
+Subtitles match what Jellyfin shows. Embedded tracks travel inside the
+stream, and external tracks (sidecar files the server lists but which are
+not muxed into the original file) are side-loaded from Jellyfin's subtitle
+endpoint, so they are no longer missing in the terminal. `v` toggles them on
+and off, `j`/`J` cycle the track, and the footer shows the current state.
 
 While an episode of a show is playing, `n` jumps to the next episode and
 `b` to the previous one (`Ctrl+→`/`Ctrl+←` work too), reloading in place at
@@ -120,10 +128,12 @@ advances.
 
 `d` toggles hardware decoding (`--hwdec=auto-safe`) on or off; the choice is
 remembered in the config and shown in the status line (`decode cpu`/`gpu`).
-It lowers CPU during decode and helps the `o` window most — for in-terminal
-video the decoded frames still copy back to the CPU to be drawn through the
-graphics protocol, so the gain there is smaller. Off by default: turn it on
-if playback is choppy or the CPU runs hot.
+It is on by default because terminal playback is CPU bound on decode and the
+GPU takes that load off the main thread — roughly a third less CPU on a
+1080p stream, which is the main lever against laggy playback. `auto-safe`
+only enables decoders known to be reliable and falls back to software by
+itself, so it is safe to leave on. Turn it off only if a particular
+machine's hardware decoder misbehaves.
 
 ## Internals
 
