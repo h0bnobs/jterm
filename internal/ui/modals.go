@@ -354,8 +354,8 @@ var helpSections = []struct{ heading, body string }{
   server to transcode (which costs server CPU), and the choice is
   remembered. Some servers pick the transcode resolution from the
   bitrate rather than the cap — the footer readout is the truth.
-  Seeking far ahead in a transcoded stream can stall while the server
-  catches up; direct play (source) seeks instantly.`},
+  Seeking in a transcoded stream takes a moment while the server
+  restarts the encode there; direct play (source) seeks instantly.`},
 	{"Sync", `  Progress is reported to Jellyfin every few seconds, exactly like the
   mobile app: resume points, watched ticks and Next Up all stay in sync
   — across quality switches and n/b episode jumps too. When playback

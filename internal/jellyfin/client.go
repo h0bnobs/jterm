@@ -269,25 +269,34 @@ func (c *Client) AdjacentEpisode(item Item, direction int) (next Item, ok bool) 
 
 // -- playback ---------------------------------------------------------------
 
-// StreamURL is the direct-play URL when maxHeight is zero. Otherwise it is a
-// server-side transcode capped at that height and bitrate, optionally
-// starting mid-item, in which case the transcoded stream's clock starts at
-// zero.
-func (c *Client) StreamURL(itemID string, maxHeight, bitrate int, startTicks int64, sessionID string) string {
-	if maxHeight == 0 {
-		return fmt.Sprintf("%s/Videos/%s/stream?static=true&api_key=%s&deviceId=%s",
-			c.Server, itemID, c.Token, c.DeviceID)
+// The token travels in stream URLs as ApiKey. The older api_key spelling is
+// rejected by current servers wherever a stream endpoint checks it.
+
+// DirectURL is the direct-play URL: the original file, untouched, seekable
+// by HTTP byte range.
+func (c *Client) DirectURL(itemID string) string {
+	return fmt.Sprintf("%s/Videos/%s/stream?static=true&ApiKey=%s&deviceId=%s",
+		c.Server, itemID, c.Token, c.DeviceID)
+}
+
+// TranscodeURL is an HLS playlist for a server-side transcode capped at the
+// given height and video bitrate.
+//
+// HLS is what the official clients use, and for a reason: the playlist
+// lists the whole item on its real timeline, so the player can start
+// anywhere and seek in both directions, and the server restarts the encode
+// wherever it is asked to. A progressive transcode started mid-item, the
+// alternative, has nothing before its start point to seek back to, and
+// begins on whatever keyframe precedes the position requested, so its clock
+// cannot be trusted either.
+func (c *Client) TranscodeURL(itemID, mediaSourceID string, maxHeight, bitrate int, sessionID string) string {
+	if mediaSourceID == "" {
+		mediaSourceID = itemID
 	}
-	u := fmt.Sprintf("%s/Videos/%s/stream.mkv?static=false&api_key=%s&deviceId=%s"+
-		"&videoCodec=h264&audioCodec=aac&maxHeight=%d&videoBitRate=%d",
-		c.Server, itemID, c.Token, c.DeviceID, maxHeight, bitrate)
-	if startTicks > 0 {
-		u += fmt.Sprintf("&startTimeTicks=%d", startTicks)
-	}
-	if sessionID != "" {
-		u += "&PlaySessionId=" + sessionID
-	}
-	return u
+	return fmt.Sprintf("%s/Videos/%s/master.m3u8?ApiKey=%s&DeviceId=%s&MediaSourceId=%s&PlaySessionId=%s"+
+		"&VideoCodec=h264&AudioCodec=aac&MaxHeight=%d&VideoBitrate=%d&AudioBitrate=192000"+
+		"&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=true",
+		c.Server, itemID, c.Token, c.DeviceID, mediaSourceID, sessionID, maxHeight, bitrate)
 }
 
 // StopEncoding tells the server to kill the transcode job for a session.
@@ -298,21 +307,25 @@ func (c *Client) StopEncoding(sessionID string) error {
 	return err
 }
 
-// ExternalSubtitles returns delivery URLs for an item's external subtitle
-// tracks.
+// Media looks up what playing an item needs beyond the item itself: the id
+// of its media source, which a transcode must name, and delivery URLs for
+// its external subtitle tracks.
 //
 // Embedded text subtitles travel inside the direct-play container, so mpv
 // already sees them. External ones (sidecar files the server found next to
 // the media, or anything not muxed into the original file) are in the
 // Jellyfin database but absent from the raw stream, which is why they show
 // in the web UI yet never reach mpv. The server can extract and serve each
-// as text on demand at this route.
-func (c *Client) ExternalSubtitles(itemID string) ([]Subtitle, error) {
+// as text on demand.
+func (c *Client) Media(itemID string) (Media, error) {
 	full, err := c.Item(itemID)
 	if err != nil {
-		return nil, err
+		return Media{}, err
 	}
-	var out []Subtitle
+	out := Media{SourceID: itemID}
+	if len(full.MediaSources) > 0 && full.MediaSources[0].ID != "" {
+		out.SourceID = full.MediaSources[0].ID
+	}
 	for _, src := range full.MediaSources {
 		sourceID := src.ID
 		if sourceID == "" {
@@ -332,8 +345,8 @@ func (c *Client) ExternalSubtitles(itemID string) ([]Subtitle, error) {
 			if title == "" {
 				title = st.Title
 			}
-			out = append(out, Subtitle{
-				URL: fmt.Sprintf("%s/Videos/%s/%s/Subtitles/%d/0/Stream.%s?api_key=%s",
+			out.Subtitles = append(out.Subtitles, Subtitle{
+				URL: fmt.Sprintf("%s/Videos/%s/%s/Subtitles/%d/0/Stream.%s?ApiKey=%s",
 					c.Server, itemID, sourceID, st.Index, ext, c.Token),
 				Title:   title,
 				Lang:    st.Language,

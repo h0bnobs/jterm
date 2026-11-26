@@ -159,37 +159,56 @@ func TestAdjacentEpisode(t *testing.T) {
 	}
 }
 
-func TestStreamURL(t *testing.T) {
+func TestStreamURLs(t *testing.T) {
 	c := jellyfin.New("http://srv:8096/", "dev", "tok", "uid")
-	// expected strings are the Python client's output for the same arguments
-	cases := []struct{ got, want string }{
-		{c.StreamURL("i1", 0, 0, 0, ""),
-			"http://srv:8096/Videos/i1/stream?static=true&api_key=tok&deviceId=dev"},
-		{c.StreamURL("i1", 720, 4_000_000, 0, ""),
-			"http://srv:8096/Videos/i1/stream.mkv?static=false&api_key=tok&deviceId=dev&videoCodec=h264&audioCodec=aac&maxHeight=720&videoBitRate=4000000"},
-		{c.StreamURL("i1", 1080, 8_000_000, 1234, "sess"),
-			"http://srv:8096/Videos/i1/stream.mkv?static=false&api_key=tok&deviceId=dev&videoCodec=h264&audioCodec=aac&maxHeight=1080&videoBitRate=8000000&startTimeTicks=1234&PlaySessionId=sess"},
+	if got, want := c.DirectURL("i1"), "http://srv:8096/Videos/i1/stream?static=true&ApiKey=tok&deviceId=dev"; got != want {
+		t.Errorf("DirectURL:\n got %s\nwant %s", got, want)
 	}
-	for _, tc := range cases {
-		if tc.got != tc.want {
-			t.Errorf("\n got %s\nwant %s", tc.got, tc.want)
+
+	// A transcode is an HLS playlist of the whole item. It must not carry a
+	// start time: a stream that begins mid-item cannot be rewound past its
+	// start, and begins on an earlier keyframe than the one asked for.
+	got := c.TranscodeURL("i1", "src1", 720, 4_000_000, "sess")
+	want := "http://srv:8096/Videos/i1/master.m3u8?ApiKey=tok&DeviceId=dev&MediaSourceId=src1&PlaySessionId=sess" +
+		"&VideoCodec=h264&AudioCodec=aac&MaxHeight=720&VideoBitrate=4000000&AudioBitrate=192000" +
+		"&SegmentContainer=ts&MinSegments=1&BreakOnNonKeyFrames=true"
+	if got != want {
+		t.Errorf("TranscodeURL:\n got %s\nwant %s", got, want)
+	}
+	if strings.Contains(strings.ToLower(got), "starttimeticks") {
+		t.Error("a transcode URL must not pin a start position")
+	}
+	// current servers reject the old api_key spelling
+	for _, u := range []string{c.DirectURL("i1"), got} {
+		if strings.Contains(u, "api_key=") || !strings.Contains(u, "ApiKey=tok") {
+			t.Errorf("token parameter in %s", u)
 		}
+	}
+	// the item is its own media source unless told otherwise
+	if u := c.TranscodeURL("i1", "", 720, 4_000_000, "s"); !strings.Contains(u, "MediaSourceId=i1&") {
+		t.Errorf("default media source: %s", u)
 	}
 }
 
-func TestExternalSubtitles(t *testing.T) {
+func TestMedia(t *testing.T) {
 	_, c := serve(t)
-	subs, err := c.ExternalSubtitles("movie-2")
-	if err != nil || len(subs) != 1 {
-		t.Fatalf("subs = %+v, %v; want the one external track", subs, err)
+	media, err := c.Media("movie-2")
+	if err != nil || len(media.Subtitles) != 1 {
+		t.Fatalf("media = %+v, %v; want the one external track", media, err)
+	}
+	if media.SourceID != "src-2" {
+		t.Errorf("SourceID = %q; want the item's media source", media.SourceID)
 	}
 	// subrip is delivered as .srt; the embedded video stream is skipped
-	want := c.Server + "/Videos/movie-2/src-2/Subtitles/2/0/Stream.srt?api_key=" + jftest.Token
-	if subs[0].URL != want || subs[0].Title != "English" || subs[0].Lang != "eng" {
-		t.Errorf("got %+v\nwant URL %s", subs[0], want)
+	sub := media.Subtitles[0]
+	want := c.Server + "/Videos/movie-2/src-2/Subtitles/2/0/Stream.srt?ApiKey=" + jftest.Token
+	if sub.URL != want || sub.Title != "English" || sub.Lang != "eng" {
+		t.Errorf("got %+v\nwant URL %s", sub, want)
 	}
-	if subs, _ := c.ExternalSubtitles("movie-1"); len(subs) != 0 {
-		t.Errorf("an item with no external tracks gave %v", subs)
+	// an item the server lists no sources for is its own source
+	plain, err := c.Media("movie-1")
+	if err != nil || len(plain.Subtitles) != 0 || plain.SourceID != "movie-1" {
+		t.Errorf("movie-1 media = %+v, %v", plain, err)
 	}
 }
 

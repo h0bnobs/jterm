@@ -64,33 +64,38 @@ func TestReporterMirrorsPlayback(t *testing.T) {
 	player := mpvtest.Start(t, map[string]any{"time-pos": 12.0, "pause": false})
 	item := jellyfin.Item{ID: "movie-1"}
 
-	// a transcode that began 100 s in: mpv's clock is 100 s behind the item's
-	r := StartReporter(jf, item, player.Path, 100*tps, 100*tps, jellyfin.Transcode, "sess")
-	waitFor(t, fake, "progress at 112 s", func(e jftest.Event) bool {
-		return e.Kind == "progress" && e.Ticks == 112*tps && !e.Paused
+	// resumed 10 s in; mpv's clock is the item's clock, whatever the play method
+	r := StartReporter(jf, item, player.Path, 10*tps, jellyfin.Transcode, "sess")
+	waitFor(t, fake, "progress at 12 s", func(e jftest.Event) bool {
+		return e.Kind == "progress" && e.Ticks == 12*tps && !e.Paused
 	})
 	player.Set("time-pos", 20.5)
 	player.Set("pause", true)
-	waitFor(t, fake, "paused progress at 120.5 s", func(e jftest.Event) bool {
-		return e.Kind == "progress" && e.Ticks == 1205*tps/10 && e.Paused
+	waitFor(t, fake, "paused progress at 20.5 s", func(e jftest.Event) bool {
+		return e.Kind == "progress" && e.Ticks == 205*tps/10 && e.Paused
+	})
+	// the user seeks back to before where this session began
+	player.Set("time-pos", 3.0)
+	waitFor(t, fake, "progress at 3 s", func(e jftest.Event) bool {
+		return e.Kind == "progress" && e.Ticks == 3*tps
 	})
 	r.Stop()
 
 	events := fake.Events()
 	first, last := events[0], events[len(events)-1]
-	if first != (jftest.Event{Kind: "start", ItemID: "movie-1", SessionID: "sess", Ticks: 100 * tps, Method: "Transcode"}) {
+	if first != (jftest.Event{Kind: "start", ItemID: "movie-1", SessionID: "sess", Ticks: 10 * tps, Method: "Transcode"}) {
 		t.Errorf("first report = %+v; want Playing at the start position", first)
 	}
-	if last.Kind != "stopped" || last.Ticks != 1205*tps/10 || last.SessionID != "sess" {
+	if last.Kind != "stopped" || last.Ticks != 3*tps || last.SessionID != "sess" {
 		t.Errorf("last report = %+v; want Stopped at the final position", last)
 	}
 	if got := kinds(events); got != "start:movie-1 progress:movie-1 stopped:movie-1" {
 		t.Errorf("report order: %s", got)
 	}
-	if r.LastTicks() != 1205*tps/10 {
+	if r.LastTicks() != 3*tps {
 		t.Errorf("LastTicks = %d", r.LastTicks())
 	}
-	if pos := fake.UserData("movie-1").PlaybackPositionTicks; pos != 1205*tps/10 {
+	if pos := fake.UserData("movie-1").PlaybackPositionTicks; pos != 3*tps {
 		t.Errorf("server resume point = %d", pos)
 	}
 }
@@ -99,7 +104,7 @@ func TestReporterEndsWhenMpvExits(t *testing.T) {
 	fastReports(t)
 	fake, jf := fakeJellyfin(t)
 	player := mpvtest.Start(t, map[string]any{"time-pos": 30.0, "pause": false})
-	r := StartReporter(jf, jellyfin.Item{ID: "movie-1"}, player.Path, 0, 0, jellyfin.DirectPlay, "")
+	r := StartReporter(jf, jellyfin.Item{ID: "movie-1"}, player.Path, 0, jellyfin.DirectPlay, "")
 	waitFor(t, fake, "first progress", func(e jftest.Event) bool { return e.Kind == "progress" })
 	player.Close() // the user pressed q in mpv
 	waitFor(t, fake, "Stopped without being told", func(e jftest.Event) bool {
@@ -113,7 +118,7 @@ func TestReporterEndsWhenMpvExits(t *testing.T) {
 
 func TestReporterThatNeverConnectsReportsNothing(t *testing.T) {
 	fake, jf := fakeJellyfin(t)
-	r := StartReporter(jf, jellyfin.Item{ID: "movie-1"}, filepath.Join(t.TempDir(), "absent.sock"), 0, 0, jellyfin.DirectPlay, "")
+	r := StartReporter(jf, jellyfin.Item{ID: "movie-1"}, filepath.Join(t.TempDir(), "absent.sock"), 0, jellyfin.DirectPlay, "")
 	started := time.Now()
 	r.Stop()
 	if time.Since(started) > 2*time.Second {
@@ -163,23 +168,27 @@ func TestWindowReporterFollowsThePlaylist(t *testing.T) {
 	}
 }
 
-func TestSubCacheFetchesOnce(t *testing.T) {
+func TestMediaCacheFetchesOnce(t *testing.T) {
 	_, jf := fakeJellyfin(t)
-	var cache SubCache
-	urls := cache.For(jf, jellyfin.Item{ID: "movie-2"})
-	if len(urls) != 1 || !strings.Contains(urls[0], "/Subtitles/2/0/Stream.srt") {
-		t.Fatalf("urls = %v", urls)
+	var cache MediaCache
+	media := cache.For(jf, jellyfin.Item{ID: "movie-2"})
+	if urls := subtitleURLs(media); len(urls) != 1 || !strings.Contains(urls[0], "/Subtitles/2/0/Stream.srt") {
+		t.Fatalf("subtitle urls = %v", urls)
+	}
+	if media.SourceID != "src-2" {
+		t.Errorf("SourceID = %q", media.SourceID)
 	}
 	jf.Token = "revoked" // any further request would now fail
-	if again := cache.For(jf, jellyfin.Item{ID: "movie-2"}); len(again) != 1 {
-		t.Errorf("second lookup went back to the server: %v", again)
+	if again := cache.For(jf, jellyfin.Item{ID: "movie-2"}); len(again.Subtitles) != 1 {
+		t.Errorf("second lookup went back to the server: %+v", again)
 	}
-	if failed := cache.For(jf, jellyfin.Item{ID: "movie-1"}); failed != nil {
-		t.Errorf("a failed lookup gave %v", failed)
+	// a failed lookup still yields something playable...
+	if failed := cache.For(jf, jellyfin.Item{ID: "movie-1"}); failed.SourceID != "movie-1" || len(failed.Subtitles) != 0 {
+		t.Errorf("a failed lookup gave %+v", failed)
 	}
-	jf.Token = jftest.Token
-	if retried := cache.For(jf, jellyfin.Item{ID: "movie-1"}); retried == nil {
-		t.Error("a failed lookup must not be cached as 'no subtitles'")
+	// ...but is not remembered as the truth
+	if _, cached := cache.items["movie-1"]; cached {
+		t.Error("a failed lookup was cached")
 	}
 }
 
@@ -323,6 +332,22 @@ func TestTerminalEpisodeStepAndQualitySwitch(t *testing.T) {
 	})
 	if transcode.ItemID != "ep-1-2" || transcode.Ticks < 30*tps || transcode.Ticks > 40*tps {
 		t.Errorf("transcode started as %+v; want episode 2 at about 30 s, where playback was", transcode)
+	}
+
+	// The switch must not move the picture: the new stream picks up where
+	// the old one was, on the item's own clock.
+	c = control(t, term)
+	if pos, _ := c.Get("time-pos", time.Second); pos == nil || pos.(float64) < 29 || pos.(float64) > 40 {
+		t.Errorf("after the switch mpv is at %v; want about 30 s", pos)
+	}
+	// And the whole item must still be there: seek back to before the point
+	// the quality was changed at, as the left arrow would.
+	c.Command("seek", 5, "absolute")
+	rewound := waitFor(t, fake, "progress from before the switch point", func(e jftest.Event) bool {
+		return e.Kind == "progress" && e.SessionID == transcode.SessionID && e.Ticks < 20*tps
+	})
+	if rewound.Ticks < 4*tps {
+		t.Errorf("after seeking to 5 s the server was told %d ticks", rewound.Ticks)
 	}
 
 	control(t, term).Command("quit")

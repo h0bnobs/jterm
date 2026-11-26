@@ -57,7 +57,7 @@ func (w *Window) Play(jf *jellyfin.Client, opts mpv.Options, item jellyfin.Item,
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	title := item.DisplayTitle()
-	url := jf.StreamURL(item.ID, 0, 0, 0, "")
+	url := jf.DirectURL(item.ID)
 	if w.running() {
 		// tell the reporter first, so it knows the URL the moment mpv
 		// switches to it

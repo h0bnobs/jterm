@@ -26,37 +26,40 @@ const (
 	clearScreen = "\x1b[H\x1b[2J"
 )
 
-// SubCache remembers each item's external subtitle URLs so they are fetched
-// once, not on every relaunch.
-type SubCache struct {
-	mu   sync.Mutex
-	urls map[string][]string
+// MediaCache remembers what each item's playback needs from the server (its
+// media source id and external subtitle URLs) so it is fetched once, not on
+// every relaunch.
+type MediaCache struct {
+	mu    sync.Mutex
+	items map[string]jellyfin.Media
 }
 
-// For returns the external subtitle delivery URLs for an item. Embedded
-// subtitles already travel in the direct-play container, so only these need
-// adding to mpv as side-loaded tracks. A failed lookup is not cached.
-func (c *SubCache) For(jf *jellyfin.Client, item jellyfin.Item) []string {
-	if item.ID == "" {
-		return nil
-	}
+// For returns the media details for an item. A failed lookup is not cached
+// and yields a usable default: no subtitles to side-load, and the item's
+// own id as its media source, which is what it is for all but multi-version
+// items.
+func (c *MediaCache) For(jf *jellyfin.Client, item jellyfin.Item) jellyfin.Media {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if urls, ok := c.urls[item.ID]; ok {
-		return urls
+	if media, ok := c.items[item.ID]; ok {
+		return media
 	}
-	subs, err := jf.ExternalSubtitles(item.ID)
+	media, err := jf.Media(item.ID)
 	if err != nil {
-		return nil
+		return jellyfin.Media{SourceID: item.ID}
 	}
-	urls := make([]string, 0, len(subs))
-	for _, s := range subs {
+	if c.items == nil {
+		c.items = map[string]jellyfin.Media{}
+	}
+	c.items[item.ID] = media
+	return media
+}
+
+func subtitleURLs(media jellyfin.Media) []string {
+	urls := make([]string, 0, len(media.Subtitles))
+	for _, s := range media.Subtitles {
 		urls = append(urls, s.URL)
 	}
-	if c.urls == nil {
-		c.urls = map[string][]string{}
-	}
-	c.urls[item.ID] = urls
 	return urls
 }
 
@@ -68,7 +71,7 @@ type Request struct {
 	Audio      bool // audio only: no video, no footer
 	Cap        config.QualityCap
 	MPV        mpv.Options
-	Subs       *SubCache
+	Media      *MediaCache
 }
 
 // Result is what a playback leaves behind for the browser.
@@ -96,8 +99,8 @@ type Terminal struct {
 
 // NewTerminal prepares a playback.
 func NewTerminal(req Request) *Terminal {
-	if req.Subs == nil {
-		req.Subs = &SubCache{}
+	if req.Media == nil {
+		req.Media = &MediaCache{}
 	}
 	sock := filepath.Join(os.TempDir(), fmt.Sprintf("jterm-mpv-%d-%s.sock", os.Getpid(), config.NewID()[:8]))
 	return &Terminal{req: req, res: Result{Cap: req.Cap}, sock: sock, in: os.Stdin, out: os.Stdout}
@@ -169,9 +172,9 @@ func (t *Terminal) runAudio() error {
 	} {
 		fmt.Fprintln(t.out, ansi.Truncate(line, cols-1, ""))
 	}
-	url := t.req.JF.StreamURL(item.ID, 0, 0, 0, "")
+	url := t.req.JF.DirectURL(item.ID)
 	cmd := t.command(t.req.MPV.Audio(t.sock, url, start/jellyfin.TicksPerSecond))
-	rep := StartReporter(t.req.JF, item, t.sock, start, 0, jellyfin.DirectPlay, "")
+	rep := StartReporter(t.req.JF, item, t.sock, start, jellyfin.DirectPlay, "")
 	defer rep.Stop()
 	t.res.PlayedIDs = append(t.res.PlayedIDs, item.ID)
 	var exit *exec.ExitError
@@ -185,13 +188,10 @@ func (t *Terminal) runAudio() error {
 
 // instance is one running mpv together with the clients attached to it.
 type instance struct {
-	cmd    *exec.Cmd
-	exited chan struct{} // closed once the process has been reaped
-	ipc    *mpv.Conn     // nil if the socket never appeared
-	rep    *Reporter
-	// offset is how far mpv's clock is behind the item's, in seconds: a
-	// mid-item transcode starts its clock at zero.
-	offset     float64
+	cmd        *exec.Cmd
+	exited     chan struct{} // closed once the process has been reaped
+	ipc        *mpv.Conn     // nil if the socket never appeared
+	rep        *Reporter
 	launchedAt time.Time
 }
 
@@ -223,25 +223,19 @@ func (t *Terminal) launch(item jellyfin.Item, qcap config.QualityCap, posTicks i
 	t.note("loading… (" + qcap.Label() + ")")
 	jf := t.req.JF
 	sessionID := config.NewID()
-	subs := t.req.Subs.For(jf, item)
+	media := t.req.Media.For(jf, item)
 
-	var url, method string
-	var startSeconds, offsetTicks int64
-	if qcap == config.Source {
-		url, method = jf.StreamURL(item.ID, 0, 0, 0, ""), jellyfin.DirectPlay
-		startSeconds = posTicks / jellyfin.TicksPerSecond
-	} else {
-		// The server starts the transcode at posTicks, so mpv itself
-		// starts from zero and the difference is carried as an offset.
-		url, method = jf.StreamURL(item.ID, int(qcap), qcap.Bitrate(), posTicks, sessionID), jellyfin.Transcode
-		offsetTicks = posTicks
+	// Direct play and a transcode both expose the whole item on its real
+	// timeline, so either way mpv is simply told where to start and its
+	// clock is the item's clock.
+	url, method := jf.DirectURL(item.ID), jellyfin.DirectPlay
+	if qcap != config.Source {
+		url = jf.TranscodeURL(item.ID, media.SourceID, int(qcap), qcap.Bitrate(), sessionID)
+		method = jellyfin.Transcode
 	}
 	_, lines := mpv.TermSize()
-	inst := &instance{
-		cmd:    t.command(t.req.MPV.Video(t.sock, url, startSeconds, lines, subs)),
-		exited: make(chan struct{}),
-		offset: float64(offsetTicks) / jellyfin.TicksPerSecond,
-	}
+	args := t.req.MPV.Video(t.sock, url, posTicks/jellyfin.TicksPerSecond, lines, subtitleURLs(media))
+	inst := &instance{cmd: t.command(args), exited: make(chan struct{})}
 	if err := inst.cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -249,7 +243,7 @@ func (t *Terminal) launch(item jellyfin.Item, qcap config.QualityCap, posTicks i
 		_ = inst.cmd.Wait()
 		close(inst.exited)
 	}()
-	inst.rep = StartReporter(jf, item, t.sock, posTicks, offsetTicks, method, sessionID)
+	inst.rep = StartReporter(jf, item, t.sock, posTicks, method, sessionID)
 	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline) && !inst.hasExited(); {
 		if c, err := mpv.Dial(t.sock); err == nil {
 			inst.ipc = c
@@ -354,9 +348,11 @@ func (t *Terminal) runVideo() error {
 		case "up", "down":
 			inst.ipc.Command("set_property", mpv.ReqProp, "none")
 			if next := qcap.Step(req == "up"); next != qcap {
-				pos := inst.offset
+				// carry on from where the picture is, or failing that
+				// from the last position the reporter saw
+				pos := float64(inst.rep.LastTicks()) / jellyfin.TicksPerSecond
 				if st.TimePos != nil {
-					pos += *st.TimePos
+					pos = *st.TimePos
 				}
 				qcap = next
 				t.res.Cap = qcap
@@ -388,18 +384,12 @@ func (t *Terminal) runVideo() error {
 			continue
 		}
 
-		// A transcode plays a partial, clock-rebased stream: shift the
-		// position and take duration and percent from the item itself.
+		// Until mpv knows the length, show the one the server has.
 		runtime := current.RuntimeSeconds()
-		transcoding := qcap != config.Source
-		if st.TimePos != nil {
-			pos := *st.TimePos + inst.offset
-			st.TimePos = &pos
-		}
-		if runtime > 0 && (transcoding || st.Duration == 0) {
+		if runtime > 0 && st.Duration == 0 {
 			st.Duration = runtime
 		}
-		if runtime > 0 && st.TimePos != nil && (transcoding || st.PercentPos == nil) {
+		if runtime > 0 && st.TimePos != nil && st.PercentPos == nil {
 			pct := *st.TimePos * 100 / runtime
 			st.PercentPos = &pct
 		}

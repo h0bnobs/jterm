@@ -158,7 +158,7 @@ func (s *Server) Handler() http.Handler {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			ok := strings.Contains(r.Header.Get("Authorization"), `Token="`+Token+`"`) ||
-				r.URL.Query().Get("api_key") == Token
+				r.URL.Query().Get("ApiKey") == Token
 			if !ok || s.revoked {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
@@ -288,11 +288,18 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	// streams: the same file whatever the item
+	// Streams: the same file whatever the item. A real server answers a
+	// transcode request with an HLS playlist covering the whole item; the
+	// fake hands back the file itself, which gives the player the same
+	// thing that matters here, a seekable stream on the item's own
+	// timeline. Like current servers it only accepts the token as ApiKey.
 	serveVideo := func(transcode bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			s.mu.Lock()
-			ok := r.URL.Query().Get("api_key") == Token && !s.revoked
+			ok := r.URL.Query().Get("ApiKey") == Token && !s.revoked
+			if transcode && r.URL.Query().Get("MediaSourceId") == "" {
+				ok = false // the HLS endpoint insists on a media source
+			}
 			fail, path := transcode && s.FailTranscode, s.VideoPath
 			s.mu.Unlock()
 			switch {
@@ -308,7 +315,7 @@ func (s *Server) Handler() http.Handler {
 		}
 	}
 	mux.HandleFunc("GET /Videos/{id}/stream", serveVideo(false))
-	mux.HandleFunc("GET /Videos/{id}/stream.mkv", serveVideo(true))
+	mux.HandleFunc("GET /Videos/{id}/master.m3u8", serveVideo(true))
 	mux.HandleFunc("GET /Videos/{id}/{source}/Subtitles/{index}/0/{file}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("1\n00:00:00,000 --> 00:09:59,000\nexternal subtitle " + r.PathValue("index") + "\n"))

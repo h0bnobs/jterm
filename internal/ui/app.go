@@ -56,9 +56,9 @@ type Model struct {
 	username   string
 
 	stack   []*Page
-	patches map[string]patch // item id -> fresh UserData, see patchTTL
-	subs    player.SubCache  // external subtitle URLs, fetched once per item
-	window  player.Window    // the reusable mpv window; browsing continues while it plays
+	patches map[string]patch  // item id -> fresh UserData, see patchTTL
+	media   player.MediaCache // media source ids and subtitle URLs, fetched once per item
+	window  player.Window     // the reusable mpv window; browsing continues while it plays
 
 	table     table.Model
 	search    textinput.Model

@@ -120,6 +120,12 @@ type Subtitle struct {
 	Default bool
 }
 
+// Media is what playback needs to know about an item's files.
+type Media struct {
+	SourceID  string     // the media source a transcode must name
+	Subtitles []Subtitle // external tracks to side-load
+}
+
 // ServerInfo is a server that answered the discovery broadcast.
 type ServerInfo struct {
 	Address string `json:"Address"`

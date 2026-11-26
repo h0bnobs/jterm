@@ -88,27 +88,24 @@ type Reporter struct {
 	sock       string
 	SessionID  string
 	PlayMethod string
-	// A transcode started mid-item has its clock rebased to zero, so mpv's
-	// time-pos is offset behind the true position.
-	offset int64
-	last   atomic.Int64
+	last       atomic.Int64
 }
 
 // StartReporter begins reporting item as playing from startTicks. An empty
 // sessionID gets a fresh one.
 func StartReporter(jf *jellyfin.Client, item jellyfin.Item, sock string,
-	startTicks, offsetTicks int64, playMethod, sessionID string) *Reporter {
+	startTicks int64, playMethod, sessionID string) *Reporter {
 	if sessionID == "" {
 		sessionID = config.NewID()
 	}
 	r := &Reporter{halter: newHalter(), jf: jf, item: item, sock: sock,
-		SessionID: sessionID, PlayMethod: playMethod, offset: offsetTicks}
+		SessionID: sessionID, PlayMethod: playMethod}
 	r.last.Store(startTicks)
 	go r.run()
 	return r
 }
 
-// LastTicks is the most recent position seen, in the item's own timeline.
+// LastTicks is the most recent position seen.
 func (r *Reporter) LastTicks() int64 { return r.last.Load() }
 
 func (r *Reporter) run() {
@@ -128,7 +125,7 @@ func (r *Reporter) run() {
 			break
 		}
 		if p, ok := mpv.Float(pos); ok && p > 0 {
-			r.last.Store(r.offset + int64(p*jellyfin.TicksPerSecond))
+			r.last.Store(int64(p * jellyfin.TicksPerSecond))
 		}
 		_ = r.jf.ReportProgress(r.item.ID, r.SessionID, r.LastTicks(), mpv.Truthy(paused), r.PlayMethod)
 		if !r.pause(progressInterval) {

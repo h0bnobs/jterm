@@ -56,7 +56,7 @@ func (m *Model) play(item jellyfin.Item, startTicks int64, audio bool) tea.Cmd {
 	}
 	t := player.NewTerminal(player.Request{
 		JF: m.jf, Item: item, StartTicks: startTicks, Audio: audio,
-		Cap: m.cfg.QualityCap, MPV: opts, Subs: &m.subs,
+		Cap: m.cfg.QualityCap, MPV: opts, Media: &m.media,
 	})
 	title := item.DisplayTitle()
 	return tea.Exec(t, func(err error) tea.Msg {
