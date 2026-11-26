@@ -64,7 +64,8 @@ type Model struct {
 	search    textinput.Model
 	help      help.Model
 	status    string
-	searching bool // the search box has the keyboard
+	searching bool  // the search box has the keyboard
+	modal     modal // when set, a box over the browser that takes every key
 	width     int
 	height    int
 }
@@ -150,7 +151,8 @@ func New(cfg config.Config, vo string) *Model {
 	return m
 }
 
-// Init starts on the home screen when there is a saved sign-in.
+// Init starts on the home screen when there is a saved sign-in, and
+// otherwise goes looking for a server.
 func (m *Model) Init() tea.Cmd {
 	if m.cfg.Server != "" && m.cfg.Token != "" {
 		m.jf = jellyfin.New(m.cfg.Server, m.cfg.DeviceID, m.cfg.Token, m.cfg.UserID)
@@ -160,8 +162,7 @@ func (m *Model) Init() tea.Cmd {
 		}
 		return m.goHome()
 	}
-	m.setStatus("not signed in")
-	return nil
+	return m.beginSetup(false, "")
 }
 
 // Update is the single place state changes.
@@ -185,8 +186,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case windowMsg:
 		m.setStatus(msg.status)
 		return m, nil
+	case discoveredMsg:
+		return m, m.discovered(msg)
+	case serverInfoMsg:
+		return m, m.serverInfo(msg)
+	case loginMsg:
+		return m, m.loggedIn(msg)
 	}
-	// anything else (the cursor blink) belongs to the search box
+	// anything else (the cursor blink) belongs to whichever text field is live
+	if m.modal != nil {
+		return m, m.modal.other(msg)
+	}
 	var cmd tea.Cmd
 	m.search, cmd = m.search.Update(msg)
 	return m, cmd
@@ -203,12 +213,16 @@ func (m *Model) layout() {
 // View draws the search box, the status line, the table and the key row.
 func (m *Model) View() tea.View {
 	status := mutedStyle.Render(ansi.Truncate("  "+m.status, max(m.width, 20), "…"))
-	v := tea.NewView(strings.Join([]string{
+	screen := strings.Join([]string{
 		m.search.View(),
 		status,
 		m.table.View(),
 		" " + m.help.ShortHelpView(helpKeys),
-	}, "\n"))
+	}, "\n")
+	if m.modal != nil {
+		screen = overlay(screen, m.modal, m.width, m.height)
+	}
+	v := tea.NewView(screen)
 	v.AltScreen = true
 	v.WindowTitle = "jterm"
 	return v
@@ -387,20 +401,15 @@ func (m *Model) reload() tea.Cmd {
 	return nil
 }
 
-// signOut is replaced by the real sign-in flow; until then a rejected token
-// can only be reported.
-func (m *Model) signOut(string) tea.Cmd {
-	m.stack = nil
-	m.table.SetRows(nil)
-	return nil
-}
-
 // -- keys -------------------------------------------------------------------
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	k := msg.String()
 	if k == "ctrl+c" {
 		return tea.Quit
+	}
+	if m.modal != nil {
+		return m.modal.key(msg)
 	}
 	if m.searching {
 		switch k {
@@ -451,6 +460,12 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.toggleFlag(true)
 	case "d":
 		m.toggleHWDec()
+	case "s":
+		if m.jf != nil {
+			m.openAccountMenu()
+		}
+	case "?":
+		m.openHelp()
 	default:
 		var cmd tea.Cmd
 		m.table, cmd = m.table.Update(msg)
