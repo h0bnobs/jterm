@@ -36,22 +36,13 @@ func detectVideoOutput() string {
 
 func main() {
 	version := flag.Bool("version", false, "print the version and exit")
-	dump := flag.Bool("dump", false, "print the Home rows as text and exit (temporary porting aid)")
 	flag.Parse()
 
 	if *version {
 		fmt.Println(jellyfin.ClientName, jellyfin.ClientVersion)
 		return
 	}
-	cfg := config.Load()
-	if *dump {
-		if err := ui.Dump(os.Stdout, cfg); err != nil {
-			fmt.Fprintln(os.Stderr, "jterm:", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if _, err := tea.NewProgram(ui.New(cfg, detectVideoOutput())).Run(); err != nil {
+	if _, err := tea.NewProgram(ui.New(config.Load(), detectVideoOutput())).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "jterm:", err)
 		os.Exit(1)
 	}

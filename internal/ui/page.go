@@ -1,12 +1,6 @@
 package ui
 
-import (
-	"fmt"
-	"io"
-
-	"github.com/h0bnobs/jterm/internal/config"
-	"github.com/h0bnobs/jterm/internal/jellyfin"
-)
+import "github.com/h0bnobs/jterm/internal/jellyfin"
 
 // Row is one line of a page: an item under a section heading.
 type Row struct {
@@ -110,20 +104,4 @@ func cells(rows []Row) [][]string {
 		})
 	}
 	return out
-}
-
-// Dump prints the Home rows as plain text using the saved sign-in. It is a
-// temporary aid for checking the port against the Python jterm.
-func Dump(w io.Writer, cfg config.Config) error {
-	if cfg.Server == "" || cfg.Token == "" {
-		return fmt.Errorf("not signed in: no server or token in %s", config.Path())
-	}
-	rows, err := homeLoader(jellyfin.New(cfg.Server, cfg.DeviceID, cfg.Token, cfg.UserID))()
-	if err != nil {
-		return err
-	}
-	for _, c := range cells(rows) {
-		fmt.Fprintf(w, "%s|%s|%s|%s|%s\n", c[0], c[1], c[2], c[3], c[4])
-	}
-	return nil
 }
