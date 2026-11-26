@@ -1,4 +1,7 @@
+# the binary `go build` leaves in the checkout
+/jterm
+
+# leftovers from the Python version
 .venv/
 __pycache__/
 *.pyc
-bin/
