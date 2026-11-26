@@ -58,6 +58,7 @@ type Model struct {
 	stack   []*Page
 	patches map[string]patch // item id -> fresh UserData, see patchTTL
 	subs    player.SubCache  // external subtitle URLs, fetched once per item
+	window  player.Window    // the reusable mpv window; browsing continues while it plays
 
 	table     table.Model
 	search    textinput.Model
@@ -181,6 +182,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.playbackDone(msg)
 	case refreshedMsg:
 		return m, m.refreshed(msg)
+	case windowMsg:
+		m.setStatus(msg.status)
+		return m, nil
 	}
 	// anything else (the cursor blink) belongs to the search box
 	var cmd tea.Cmd
@@ -234,6 +238,9 @@ func (m *Model) idleStatus(extra string) {
 		decode = "gpu"
 	}
 	var bits []string
+	if playing := m.window.NowPlaying(); playing != "" {
+		bits = append(bits, "▶ window: "+firstRunes(playing, 30)+" (x stop)")
+	}
 	for _, bit := range []string{where, "video: " + vo + " · decode " + decode, strings.Join(titles, " › "), extra} {
 		if bit != "" {
 			bits = append(bits, bit)
@@ -422,6 +429,12 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.playSelected(false, true)
 	case "a":
 		return m.playSelected(true, false)
+	case "o":
+		return m.windowSelected(false)
+	case "e":
+		return m.windowSelected(true)
+	case "x":
+		return m.windowStop()
 	case "esc", "backspace":
 		m.back()
 	case "g":
