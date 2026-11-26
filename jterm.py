@@ -34,18 +34,25 @@ from textual.widgets.option_list import Option
 
 CONFIG_PATH = os.path.expanduser("~/.config/jterm/config.json")
 INPUT_CONF_PATH = os.path.expanduser("~/.config/jterm/input.conf")
-# Ctrl+Up/Down change the quality cap by signalling jterm through an mpv
-# user-data property; n/b step to the next/previous episode the same way
-# (Ctrl+Right/Left as alternates for terminals that eat plain letters).
-# Everything else keeps mpv defaults. These bindings only exist inside mpv
-# during playback, so they never clash with the browser's keys.
+# Up/Down adjust volume by 5%; Ctrl+Up/Down change the quality cap by
+# signalling jterm through an mpv user-data property; n/b step to the
+# next/previous episode the same way (Ctrl+Right/Left as alternates for
+# terminals that eat plain letters); v toggles subtitles and j/J cycle the
+# subtitle track. Everything else keeps mpv defaults. These bindings only
+# exist inside mpv during playback, so they never clash with the browser's
+# keys.
 INPUT_CONF = (
+    "UP add volume 5\n"
+    "DOWN add volume -5\n"
     "Ctrl+UP set user-data/jterm/req up\n"
     "Ctrl+DOWN set user-data/jterm/req down\n"
     "n set user-data/jterm/req next\n"
     "b set user-data/jterm/req prev\n"
     "Ctrl+RIGHT set user-data/jterm/req next\n"
     "Ctrl+LEFT set user-data/jterm/req prev\n"
+    "v cycle sub-visibility\n"
+    "j cycle sub\n"
+    "J cycle sub down\n"
 )
 CLIENT_NAME = "jterm"
 CLIENT_VERSION = "0.1.0"
@@ -72,7 +79,7 @@ UD_PATCH_TTL = 300.0
 MPV_STATUS = (
     "${?pause==yes:⏸ }${!pause==yes:▶ }"
     "${time-pos} / ${duration} (${percent-pos}%)  vol ${volume}"
-    " │ q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · m mute · [ ] speed"
+    " │ q quit · spc pause · ←/→ 5s · ↑/↓ vol · m mute · [ ] speed"
 )
 
 FOLDER_TYPES = {
@@ -95,7 +102,7 @@ HELP_TEXT = """\
   x        stop the window player
   w        toggle watched / unwatched
   f        toggle favourite
-  d        toggle GPU / hardware decoding (off by default)
+  d        toggle GPU / hardware decoding (on by default)
   Esc      back (also jumps from the search box to the list)
   g        home screen
   ctrl+r   refresh the current view
@@ -109,12 +116,12 @@ HELP_TEXT = """\
   over it, even when resizing.
   q        stop (position is saved to the server)
   space    pause / resume
-  ←/→      seek 5 s        ↑/↓   seek 1 min
+  ←/→      seek 5 s        ↑/↓   volume ±5%
   Ctrl+↑/↓ raise / lower quality (reloads in place, keeps position)
   n / b    next / previous episode of the series (manual only —
            movies have no sequence; Ctrl+→/← do the same)
-  9/0      volume          m     mute
-  [ / ]    playback speed  ,/.   frame step (paused)
+  v        subtitles on/off  j / J cycle subtitle track
+  m        mute            [ / ] playback speed   ,/. frame step
 
 [b]Quality[/b]
   The footer shows the live resolution. Ctrl+↑/↓ step the cap across
@@ -141,10 +148,10 @@ HELP_TEXT = """\
 
 [b]GPU / hardware decoding[/b]
   d toggles hardware decoding (--hwdec=auto-safe) on or off; the choice
-  is remembered. It lowers CPU during decode and helps the o window
-  most. For in-terminal video the frames still copy back to the CPU to
-  be drawn, so the gain there is smaller. Off by default — turn it on
-  if playback is choppy or CPU runs hot.
+  is remembered. On by default because it cuts decode CPU (roughly a
+  third less on a 1080p stream) and so reduces playback lag. auto-safe
+  only uses decoders known to be reliable and falls back to software on
+  its own. Turn it off only if a particular machine's hwdec misbehaves.
 """
 
 
@@ -171,6 +178,22 @@ def detect_video_output() -> str:
     if os.environ.get("KITTY_WINDOW_ID") or "kitty" in os.environ.get("TERM", ""):
         return "kitty"
     return "tct"  # true-colour half-blocks, works everywhere
+
+
+def term_size() -> os.terminal_size:
+    """The live terminal size straight from the tty ioctl.
+
+    shutil.get_terminal_size honours $LINES/$COLUMNS first, and those go
+    stale the moment the pane is split or resized — leaving the footer
+    painted at the old bottom (off-screen) while mpv sizes the video to the
+    true, smaller pane and overlaps it. Querying the tty directly keeps the
+    footer pinned to the real bottom across resizes."""
+    for stream in (sys.__stdout__, sys.__stderr__, sys.__stdin__):
+        try:
+            return os.get_terminal_size(stream.fileno())
+        except (OSError, AttributeError, ValueError):
+            continue
+    return os.terminal_size((80, 24))
 
 
 # --------------------------------------------------------------------------
@@ -383,6 +406,34 @@ class Jellyfin:
         """Tell the server to kill the transcode job for a play session."""
         self.delete("/Videos/ActiveEncodings", {
             "deviceId": self.device_id, "playSessionId": session_id})
+
+    def external_subtitles(self, item_id: str) -> list[dict]:
+        """Delivery URLs for an item's external subtitle tracks.
+
+        Embedded text subtitles travel inside the direct-play container, so
+        mpv already sees them. External ones (sidecar files the server found
+        next to the media, or anything not muxed into the original file) are
+        in the Jellyfin database but absent from the raw stream, which is why
+        they show in the web UI yet never reach mpv. The server can extract
+        and serve each as text on demand at this route."""
+        full = self.item(item_id)
+        out: list[dict] = []
+        for src in (full.get("MediaSources") or []):
+            source_id = src.get("Id") or item_id
+            for st in (src.get("MediaStreams") or []):
+                if st.get("Type") != "Subtitle" or not st.get("IsExternal"):
+                    continue
+                codec = (st.get("Codec") or "").lower()
+                ext = codec if codec in ("ass", "ssa", "vtt", "sub") else "srt"
+                out.append({
+                    "url": (f"{self.server}/Videos/{item_id}/{source_id}"
+                            f"/Subtitles/{st.get('Index')}/0/Stream.{ext}"
+                            f"?api_key={self.token}"),
+                    "title": st.get("DisplayTitle") or st.get("Title") or "",
+                    "lang": st.get("Language") or "",
+                    "default": bool(st.get("IsDefault") or st.get("IsForced")),
+                })
+        return out
 
     def report_start(self, item_id: str, session_id: str, ticks: int,
                      play_method: str = "DirectPlay") -> None:
@@ -675,13 +726,20 @@ def resume_ticks(item: dict) -> int:
 FOOTER_ROWS = 2
 FOOTER_BG = "\x1b[48;2;40;46;66m"     # subtle blue-grey, distinct from the bg
 FOOTER_FG = "\x1b[38;2;236;236;245m"
-KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ 1m · 9/0 vol · ⌃↑/↓ quality · n/b next/prev ep · m mute"
+KEY_HINTS = "q quit · spc pause · ←/→ 5s · ↑/↓ vol · ⌃↑/↓ quality · n/b ep · v subs · j track · m mute"
 
 
 def footer_margin_ratio(lines: int) -> float:
     """Fraction of the video area to reserve so the footer's rows stay clear.
     Recomputed from the live terminal height so a resize keeps it exact."""
     return round(FOOTER_ROWS / max(lines, FOOTER_ROWS + 1), 4)
+
+
+def sub_label(st: dict) -> str:
+    """Subtitle state for the footer: which track and whether it shows."""
+    if not st.get("sid"):
+        return "no subs"
+    return "subs off" if st.get("sub-visibility") is False else "subs on"
 
 
 def footer_lines(st: dict, title: str, cols: int) -> list[str]:
@@ -695,7 +753,8 @@ def footer_lines(st: dict, title: str, cols: int) -> list[str]:
     res = f"{w}x{h}" if w and h else "…"
     cap = st.get("cap")
     capstr = f" (≤{cap}p)" if cap and cap != "source" else " (source)"
-    line1 = f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}{capstr}   {title}"
+    line1 = (f" {icon} {pos} / {dur} ({pct})   vol {vol}   {res}{capstr}"
+             f"   {sub_label(st)}   {title}")
     return [line1, " " + KEY_HINTS]
 
 
@@ -950,7 +1009,7 @@ class JTerm(App):
         self.cfg = load_config()
         if not self.cfg.get("device_id"):
             self.cfg["device_id"] = uuid.uuid4().hex
-        self.hwdec = bool(self.cfg.get("hwdec", False))
+        self.hwdec = bool(self.cfg.get("hwdec", True))
         cap = self.cfg.get("quality_cap", "source")
         self.quality_cap = cap if cap in QUALITY_CAPS else "source"
         self.jf: Jellyfin | None = None
@@ -959,6 +1018,8 @@ class JTerm(App):
         self.stack: list[Page] = []
         # item id -> (monotonic time, fresh UserData) — see UD_PATCH_TTL
         self._ud_patch: dict[str, tuple[float, dict]] = {}
+        # item id -> external subtitle delivery URLs (fetched once per item)
+        self._sub_cache: dict[str, list[str]] = {}
         # A single reusable mpv window driven over IPC, so the TUI stays
         # interactive for browsing while a video plays (issue #5).
         self._win_proc: subprocess.Popen | None = None
@@ -1410,12 +1471,12 @@ class JTerm(App):
         return ["--profile=sw-fast"]
 
     def _print_control_centre(self, title: str, mode_desc: str) -> None:
-        cols = shutil.get_terminal_size().columns
+        cols = term_size().columns
         bar = "─" * min(cols - 1, 110)
         print(f"▶ {title}"[: cols - 1])
         print(bar)
-        print(" q quit to browser │ space pause │ ←/→ seek 5s │ ↑/↓ seek 1m "
-              "│ 9/0 volume │ m mute │ [ ] speed"[: cols - 1])
+        print(" q quit to browser │ space pause │ ←/→ seek 5s │ ↑/↓ volume "
+              "│ m mute │ [ ] speed"[: cols - 1])
         print(f" {mode_desc}"[: cols - 1])
         print(bar)
 
@@ -1533,17 +1594,35 @@ class JTerm(App):
             tempfile.gettempdir(),
             f"jterm-mpv-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock")
 
-    def _video_cmd(self, url: str, start_ticks: int, sock_path: str) -> list[str] | None:
+    def _external_subs(self, item: dict) -> list[str]:
+        """External subtitle delivery URLs for an item, fetched once and
+        cached. Embedded subs already travel in the direct-play container,
+        so only these need adding to mpv as side-loaded tracks."""
+        iid = item.get("Id")
+        if not iid:
+            return []
+        if iid not in self._sub_cache:
+            try:
+                self._sub_cache[iid] = [s["url"]
+                                        for s in self.jf.external_subtitles(iid)]
+            except JFError:
+                return []
+        return self._sub_cache[iid]
+
+    def _video_cmd(self, url: str, start_ticks: int, sock_path: str,
+                   sub_files: list[str] = ()) -> list[str] | None:
         """Build the in-terminal mpv command with the footer band reserved.
 
         --video-margin-ratio-bottom physically keeps the video out of the
         footer's rows (unlike --vo-kitty-rows, which only overrides mpv's
         size detection and lets the image draw over the band anyway).
+        External subtitle tracks are side-loaded with --sub-file, since the
+        direct-play stream of the original file does not carry them.
         """
         cmd = self._mpv_base(sock_path)
         if cmd is None:
             return None
-        ratio = footer_margin_ratio(shutil.get_terminal_size().lines)
+        ratio = footer_margin_ratio(term_size().lines)
         cmd += [
             f"--vo={self.vo}",
             "--term-status-msg=",
@@ -1552,6 +1631,8 @@ class JTerm(App):
         cmd += self._decode_flags()
         if self.vo == "kitty":
             cmd.append("--vo-kitty-use-shm=yes")
+        for sub in sub_files:
+            cmd.append(f"--sub-file={sub}")
         if start_ticks:
             cmd.append(f"--start={start_ticks // TICKS_PER_SECOND}")
         cmd.append(url)
@@ -1678,18 +1759,19 @@ class JTerm(App):
                 os.unlink(sock_path)
             except OSError:
                 pass
-            size = shutil.get_terminal_size()
+            size = term_size()
             label = "source" if cap == "source" else f"≤{cap}p"
             draw_footer([f" loading… ({label})", " " + KEY_HINTS],
                         size.lines, size.columns)
             session_id = uuid.uuid4().hex
+            subs = self._external_subs(current)
             if cap == "source":
                 url = self.jf.stream_url(current["Id"])
-                cmd = self._video_cmd(url, pos_ticks, sock_path)
+                cmd = self._video_cmd(url, pos_ticks, sock_path, subs)
                 offset_ticks = 0
             else:
                 url = self.jf.stream_url(current["Id"], cap, pos_ticks, session_id)
-                cmd = self._video_cmd(url, 0, sock_path)
+                cmd = self._video_cmd(url, 0, sock_path, subs)
                 offset_ticks = pos_ticks
             if cmd is None:
                 return None, None, 0.0
@@ -1726,7 +1808,7 @@ class JTerm(App):
         proc, ipc, offset = launch(self.quality_cap, start_ticks)
         launched_at = time.time()
         props = ("time-pos", "duration", "percent-pos", "volume", "pause",
-                 "width", "height")
+                 "width", "height", "sub-visibility", "sid")
         last_lines = None
         try:
             while proc is not None:
@@ -1736,7 +1818,7 @@ class JTerm(App):
                     if (self.quality_cap != "source" and proc.returncode
                             and time.time() - launched_at < 8):
                         pos_ticks = reporter.last_ticks if reporter else start_ticks
-                        size = shutil.get_terminal_size()
+                        size = term_size()
                         draw_footer([" transcode failed — back to source quality",
                                      " " + KEY_HINTS], size.lines, size.columns)
                         time.sleep(1.5)
@@ -1747,7 +1829,7 @@ class JTerm(App):
                         last_lines = None
                         continue
                     break
-                size = shutil.get_terminal_size()
+                size = term_size()
                 # Keep mpv's reserved bottom band exactly FOOTER_ROWS tall as
                 # the pane is resized, so the video can never creep over it.
                 if ipc and size.lines != last_lines:
