@@ -5,16 +5,19 @@ Browse and stream your Jellyfin library in the terminal.
 Sister project of [yterm](https://github.com/h0bnobs/yterm) — same idea, but
 pointed at your own Jellyfin server instead of YouTube, and as seamless as the
 mobile app: auto-discovery, remembered sign-in, resume points, watched-state
-sync and episode autoplay.
+sync and next/previous episode keys.
 
 ## Install
 
 ```
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+go install github.com/h0bnobs/jterm@latest
 ```
 
-mpv must be installed (`apt install mpv` or similar). Then run `./jterm`
-(symlink it into `~/.local/bin` if you like).
+That puts a single `jterm` binary in `~/go/bin`; make sure it is on your
+`PATH`. Building needs Go 1.26, which any Go from 1.21 on fetches by itself.
+Playing needs [mpv](https://mpv.io) (`apt install mpv` or similar).
+
+From a checkout, `go build` leaves the binary at `./jterm`.
 
 ## First run
 
@@ -53,7 +56,7 @@ Just like the mobile app, the home screen shows:
 | `Ctrl+r` | Refresh the current view                                 |
 | `s`      | Server / account menu (switch user or server)            |
 | `?`      | Help screen with everything above                        |
-| `q`      | Quit                                                     |
+| `q`      | Quit (`Ctrl+c` works anywhere)                           |
 
 ## Stays in sync
 
@@ -86,6 +89,8 @@ stream, and external tracks (sidecar files the server lists but which are
 not muxed into the original file) are side-loaded from Jellyfin's subtitle
 endpoint, so they are no longer missing in the terminal. `v` toggles them on
 and off, `j`/`J` cycle the track, and the footer shows the current state.
+One limit: below source quality the server's stream carries only video and
+audio, so embedded tracks are unavailable there and only external ones show.
 
 While an episode of a show is playing, `n` jumps to the next episode and
 `b` to the previous one (`Ctrl+→`/`Ctrl+←` work too), reloading in place at
@@ -107,12 +112,18 @@ sharp video run jterm inside kitty, or press `o` for a real mpv window.
 `Ctrl+↑/↓` during playback steps a quality cap across source / 1080 / 720 /
 480 / 360. Anything below source asks the server to transcode (h264/aac at a
 bitrate mapped from the cap), reloading the stream in place at the current
-position; the choice is remembered for next time. Notes: transcoding costs
-server CPU; some servers (Jellyfin 10.11 among them) pick the transcode
+position; the choice is remembered for next time.
+
+A transcode is requested as HLS, the way the official clients do it, so the
+whole item stays on its real timeline: you can seek anywhere in it, in both
+directions, and a quality switch carries on from where the picture
+was. Each seek takes a couple of seconds while the server restarts the
+encode at the new position; direct play seeks instantly.
+
+Notes: transcoding costs server CPU; some servers pick the transcode
 resolution from the bitrate rather than the requested height, so trust the
-footer's live resolution readout; seeking far ahead of a transcode can stall
-while the server catches up; and if a transcode fails outright jterm falls
-back to source quality with a note in the footer.
+footer's live resolution readout; and if a transcode fails outright jterm
+falls back to source quality with a note in the footer.
 
 ## Browse while playing
 
@@ -135,11 +146,50 @@ only enables decoders known to be reliable and falls back to software by
 itself, so it is safe to leave on. Turn it off only if a particular
 machine's hardware decoder misbehaves.
 
+## Environment
+
+| Variable               | Effect                                                    |
+|------------------------|-----------------------------------------------------------|
+| `JTERM_VO`             | mpv video output, `kitty` or `tct`, instead of detecting  |
+| `JTERM_CONFIG_DIR`     | where the config lives, instead of `~/.config/jterm`      |
+| `JTERM_DISCOVERY_ADDR` | `host:port` to send the discovery datagram to, instead of the local broadcast address — another subnet's broadcast address, say |
+
 ## Internals
 
-- Python + Textual TUI, stdlib-only Jellyfin client: `jterm.py`
-- Server discovery: Jellyfin UDP broadcast protocol on port 7359
-- Playback: system mpv suspending the TUI; a sidecar thread polls mpv's JSON
-  IPC socket and posts `/Sessions/Playing[/Progress|/Stopped]` to the server
-- Config: `~/.config/jterm/config.json` (server address, device id, user id,
-  session token — never your password)
+- Go, with [Bubble Tea](https://github.com/charmbracelet/bubbletea) for the
+  TUI; everything that talks to Jellyfin or mpv uses only the standard library
+- `internal/jellyfin` — API client, and server discovery over Jellyfin's UDP
+  broadcast protocol on port 7359
+- `internal/mpv` — JSON IPC client, mpv command lines, the control footer
+- `internal/player` — the in-terminal playback loop, audio, the window
+  player, and the reporters that post
+  `/Sessions/Playing[/Progress|/Stopped]` to the server
+- `internal/ui` — the browser: page stack, table, search, modal boxes
+- `internal/config` — `~/.config/jterm/config.json` (server address, device
+  id, user id, session token — never your password)
+- Playback: the browser hands the terminal to system mpv; one loop polls
+  mpv's IPC socket to draw the footer and act on forwarded keys, while a
+  reporter mirrors progress to the server over a second connection
+
+## Development
+
+```
+go test ./...
+```
+
+The playback tests drive the real mpv binary with no video or audio output,
+and need ffmpeg to make a test clip; they are skipped where either is
+missing.
+
+To try the TUI without a real server, `internal/jftest/fakejf` serves a small
+in-memory Jellyfin (two films, one series):
+
+```
+go run ./internal/jftest/fakejf -video some.mkv
+JTERM_CONFIG_DIR=$(mktemp -d) JTERM_DISCOVERY_ADDR=127.0.0.1:17359 jterm
+```
+
+Sign in as `demo` / `demo`.
+
+jterm began as a single Python file built on Textual. That version is at the
+`python-final` tag.
