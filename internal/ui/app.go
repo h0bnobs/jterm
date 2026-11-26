@@ -17,6 +17,7 @@ import (
 
 	"github.com/h0bnobs/jterm/internal/config"
 	"github.com/h0bnobs/jterm/internal/jellyfin"
+	"github.com/h0bnobs/jterm/internal/player"
 )
 
 // The list endpoints serve UserData from a server-side cache that lags
@@ -56,6 +57,7 @@ type Model struct {
 
 	stack   []*Page
 	patches map[string]patch // item id -> fresh UserData, see patchTTL
+	subs    player.SubCache  // external subtitle URLs, fetched once per item
 
 	table     table.Model
 	search    textinput.Model
@@ -175,6 +177,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case userDataMsg:
 		m.userDataChanged(msg)
 		return m, nil
+	case playbackDoneMsg:
+		return m, m.playbackDone(msg)
+	case refreshedMsg:
+		return m, m.refreshed(msg)
 	}
 	// anything else (the cursor blink) belongs to the search box
 	var cmd tea.Cmd
@@ -412,6 +418,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 	case "enter":
 		return m.open()
+	case "b":
+		return m.playSelected(false, true)
+	case "a":
+		return m.playSelected(true, false)
 	case "esc", "backspace":
 		m.back()
 	case "g":
@@ -457,7 +467,7 @@ func (m *Model) open() tea.Cmd {
 		}
 		return m.push(title, childLoader(m.jf, item), &item)
 	}
-	return nil
+	return m.play(item, item.ResumeTicks(), false)
 }
 
 func (m *Model) back() {
