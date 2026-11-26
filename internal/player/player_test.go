@@ -380,6 +380,78 @@ func TestTerminalFallsBackWhenTranscodeIsRefused(t *testing.T) {
 	}
 }
 
+func TestWindowReplaceEnqueueAndStop(t *testing.T) {
+	fastReports(t)
+	fake, jf := fakeJellyfin(t)
+	// borrow the headless mpv setup; with no video output no window opens
+	term, _ := realPlayer(t, fake, jf, Request{})
+	opts := term.req.MPV
+	movie1, _ := jf.Item("movie-1")
+	movie2, _ := jf.Item("movie-2")
+	started := func(id string) func(jftest.Event) bool {
+		return func(e jftest.Event) bool { return e.Kind == "start" && e.ItemID == id }
+	}
+
+	var win Window
+	if got := win.Stop(); got != "no window player is running" {
+		t.Errorf("Stop with no window: %q", got)
+	}
+	// e with no window open simply opens one
+	if got := win.Play(jf, opts, movie1, 0, true); got != "now playing in window: Big Buck Bunny — browsing stays live" {
+		t.Errorf("first Play: %q", got)
+	}
+	waitFor(t, fake, "movie-1 in the window", started("movie-1"))
+	if win.NowPlaying() != "Big Buck Bunny" {
+		t.Errorf("NowPlaying = %q", win.NowPlaying())
+	}
+
+	// o on another item swaps it into the same window, from its resume point
+	pid := win.cmd.Process.Pid
+	if got := win.Play(jf, opts, movie2, 40*tps, false); got != "now playing in window: Sintel — browsing stays live" {
+		t.Errorf("replace: %q", got)
+	}
+	second := waitFor(t, fake, "movie-2 in the window", started("movie-2"))
+	if second.Ticks != 40*tps {
+		t.Errorf("movie-2 started at %d; want its resume point", second.Ticks)
+	}
+	if win.cmd.Process.Pid != pid {
+		t.Error("replace opened a second window instead of reusing the first")
+	}
+
+	// e queues without interrupting; the queue is reached when the playlist advances
+	if got := win.Play(jf, opts, movie1, 0, true); got != "queued in window: Big Buck Bunny — browsing stays live" {
+		t.Errorf("enqueue: %q", got)
+	}
+	if win.NowPlaying() != "Sintel" {
+		t.Errorf("queueing changed NowPlaying to %q", win.NowPlaying())
+	}
+	c, err := mpv.Dial(win.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Command("playlist-next")
+	_, _ = c.Get("pid", time.Second)
+	c.Close()
+	first := waitFor(t, fake, "movie-1's first session", started("movie-1"))
+	waitFor(t, fake, "the queued item to start", func(e jftest.Event) bool {
+		return e.Kind == "start" && e.ItemID == "movie-1" && e.SessionID != first.SessionID
+	})
+
+	if got := win.Stop(); got != "stopped the window player" {
+		t.Errorf("Stop: %q", got)
+	}
+	if win.NowPlaying() != "" {
+		t.Error("the window still claims to be playing after Stop")
+	}
+	events := fake.Events()
+	sessionsClosed(t, events)
+	want := "start:movie-1 progress:movie-1 stopped:movie-1 start:movie-2 progress:movie-2 stopped:movie-2 " +
+		"start:movie-1 progress:movie-1 stopped:movie-1"
+	if got := kinds(events); got != want {
+		t.Errorf("reports:\n got %s\nwant %s", got, want)
+	}
+}
+
 func TestTerminalAudio(t *testing.T) {
 	fastReports(t)
 	fake, jf := fakeJellyfin(t)
