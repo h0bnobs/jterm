@@ -320,6 +320,11 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, s.UserData(r.PathValue("id")))
 	})
 	mux.HandleFunc("POST /_test/revoke", func(w http.ResponseWriter, r *http.Request) { s.Revoke() })
+	mux.HandleFunc("POST /_test/fail-transcode/{on}", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.FailTranscode = r.PathValue("on") == "true"
+		s.mu.Unlock()
+	})
 	mux.HandleFunc("POST /_test/position/{id}/{seconds}", func(w http.ResponseWriter, r *http.Request) {
 		secs, _ := strconv.ParseInt(r.PathValue("seconds"), 10, 64)
 		s.SetPosition(r.PathValue("id"), secs*jellyfin.TicksPerSecond)
