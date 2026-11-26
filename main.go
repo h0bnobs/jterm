@@ -15,6 +15,8 @@ import (
 	"os"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/h0bnobs/jterm/internal/config"
 	"github.com/h0bnobs/jterm/internal/jellyfin"
 	"github.com/h0bnobs/jterm/internal/ui"
@@ -49,7 +51,8 @@ func main() {
 		}
 		return
 	}
-	_ = detectVideoOutput
-	fmt.Fprintln(os.Stderr, "jterm: the browser is not built yet; try -dump")
-	os.Exit(1)
+	if _, err := tea.NewProgram(ui.New(cfg, detectVideoOutput())).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "jterm:", err)
+		os.Exit(1)
+	}
 }
